@@ -8,8 +8,12 @@
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
-  const num = (v) => (v == null || v === '' || !Number.isFinite(+v) || +v < 0 ? null : Math.floor(+v));
   const plural = (n, w) => n + ' ' + w + (n > 1 ? 's' : '');
+  const round5 = (v) => Math.round(v / 5) * 5;
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const fmtNum = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+  const intOrNull = (v) => { const s = String(v == null ? '' : v).trim(); return /^\d{1,3}$/.test(s) ? +s : null; };
+  const timeOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 36000 ? r1(v) : null);
 
   const store = {
     get(k, d) {
@@ -26,23 +30,33 @@
   const SERIES = ['Rick et Morty', 'Kaamelott', 'The Office', 'Friends', 'Les Simpson', 'Bref', 'Breaking Bad', 'Brooklyn Nine-Nine', 'Game of Thrones', 'One Piece'];
 
   const LEVELS = [
-    { min: 90, label: 'Inquiétant', line: 'Ça commence sérieusement à faire peur.' },
-    { min: 70, label: 'Trop fan', line: 'Connaît les répliques mieux que les scénaristes.' },
-    { min: 45, label: 'Vrai fan', line: 'Solide. Mais on a vu plus obsédé.' },
-    { min: 20, label: 'Spectateur du dimanche', line: "Connaît le générique, c'est un début." },
+    { min: 85, label: 'Inquiétant', line: 'Ça commence sérieusement à faire peur.' },
+    { min: 65, label: 'Trop fan', line: 'Connaît les répliques mieux que les scénaristes.' },
+    { min: 40, label: 'Vrai fan', line: 'Solide. Mais on a vu plus obsédé.' },
+    { min: 15, label: 'Spectateur du dimanche', line: "Connaît le générique, c'est un début." },
     { min: 0, label: 'Touriste', line: 'A vu deux épisodes chez un pote.' }
   ];
+  const LEVEL_BOUNDS = [[85, 100], [65, 84], [40, 64], [15, 39], [0, 14]];
   const levelFor = (p) => LEVELS.find((l) => p >= l.min);
+
+  // Barème du quiz : points de base, multipliés selon l'indice auquel on trouve
+  const BASE = { r: 500, e: 300, s: 100, n: 100 };
+  const STEPS = [0.1, 0.5, 1, 2, 4];
+  const MULTS = [1, 0.85, 0.7, 0.55, 0.42, 0.3];
+  const LAST_MULT = 0.2;
+  const fmtMult = (m) => '×' + String(m).replace('.', ',');
+  const fmtSec = (d) => String(d).replace('.', ',') + ' s';
 
   const S = {
     sound: store.get('tf_sound', true),
     setup: store.get('tf_setup', null) || { serie: '', players: [''], total: 10, chrono: 10 },
     duel: store.get('tf_duel', null),
-    draft: store.get('tf_draft', null),
+    draft: store.get('tf_draft2', null),
     quiz: null,
     route: null,
     bump: null,
     card: null,
+    cardData: null,
     cardText: '',
     shareLink: null
   };
@@ -88,7 +102,7 @@
   };
 
   /* =========================================================
-     Comparaison des réponses
+     Comparaison des réponses (permissive sur les noms propres)
      ========================================================= */
   function normText(s) {
     return String(s || '').toLowerCase().replace(/œ/g, 'oe').replace(/æ/g, 'ae')
@@ -118,11 +132,19 @@
     if (!m) return 1;
     return 1 - seqLev(a, b, same) / m;
   }
-  // Deux mots sont "pareils" s'ils sont identiques, ou à une faute de frappe près pour les mots longs.
+  // Clé sonore grossière : Morty = Mortie, Rick = Rik, Meeseeks = Miseeks...
+  function phon(t) {
+    let s = t.replace(/ph/g, 'f').replace(/qu/g, 'k').replace(/ck/g, 'k').replace(/c(?=[eiy])/g, 's')
+      .replace(/[cq]/g, 'k').replace(/y/g, 'i').replace(/w/g, 'v').replace(/h/g, '').replace(/(.)\1+/g, '$1');
+    if (s.length > 3) s = s.replace(/[estxdz]+$/, '');
+    return s || t;
+  }
   function tokEq(a, b) {
     if (a === b) return true;
-    if (Math.min(a.length, b.length) < 5) return false;
-    return charRatio(a, b) >= 0.8;
+    const L = Math.min(a.length, b.length);
+    if (L >= 3 && phon(a) === phon(b)) return true;
+    if (L < 5) return false;
+    return seqLev(a, b, same) <= (L >= 8 ? 2 : 1);
   }
 
   function lcsMatched(A, B, eq) {
@@ -153,12 +175,13 @@
     if (A.length && et.length) {
       const d = seqLev(et, A, tokEq);
       const wordSim = 1 - d / Math.max(et.length, A.length);
-      const chSim = charRatio(et.join(' '), A.join(' '));
+      const chSim = charRatio(et.map(phon).join(' '), A.map(phon).join(' '));
       hit = lcsMatched(et, A, tokEq);
-      // "Presque" aussi quand près de la moitié de la réplique est juste, dans l'ordre, sans mots inventés
       const coverage = hit.size / et.length;
       const precision = hit.size / A.length;
-      score = d === 0 ? 2 : (wordSim >= 0.6 || chSim >= 0.75 || (coverage >= 0.45 && precision >= 0.8)) ? 1 : 0;
+      const glued = et.map(phon).join('') === A.map(phon).join('');
+      if (glued) hit = new Set(et.map((_, k) => k));
+      score = d === 0 || glued ? 2 : (wordSim >= 0.6 || chSim >= 0.72 || (coverage >= 0.45 && precision >= 0.75)) ? 1 : 0;
     }
     const parts = words.map((x, wi) => {
       const idx = [];
@@ -170,39 +193,38 @@
     return { score, parts };
   }
 
+  const CODE_RE = /\bs\s*0*(\d{1,2})\s*[-.:]?\s*e(?:p|pisode)?\s*0*(\d{1,3})\b|\b0*(\d{1,2})\s*x\s*0*(\d{1,3})\b|saison\s*0*(\d{1,2})\D{1,14}?(?:episode|ep|e)\s*0*(\d{1,3})/;
   function parseCode(s) {
-    const t = normText(s);
-    const m = t.match(/\bs\s*0*(\d{1,2})\s*[-.:]?\s*e(?:p|pisode)?\s*0*(\d{1,3})\b/) ||
-      t.match(/\b0*(\d{1,2})\s*x\s*0*(\d{1,3})\b/) ||
-      t.match(/saison\s*0*(\d{1,2})\D{1,14}?(?:episode|ep|e)\s*0*(\d{1,3})/);
-    return m ? [+m[1], +m[2]] : null;
+    const m = normText(s).match(CODE_RE);
+    if (!m) return null;
+    const a = m[1] || m[3] || m[5], b = m[2] || m[4] || m[6];
+    return [+a, +b];
   }
+  const onlyCode = (s) => !normText(s).replace(new RegExp(CODE_RE.source, 'g'), '').replace(/[^a-z0-9]/g, '');
 
   const STOP = new Set(['le', 'la', 'les', 'l', 'un', 'une', 'des', 'de', 'du', 'd', 'et', 'a', 'au', 'aux', 'en', 'the', 'of', 'and', 'episode', 'ep']);
 
+  function matchTitle(title, ans) {
+    const tt = toks(title), at = toks(ans);
+    if (!tt.length || !at.length) return false;
+    const tj = tt.map(phon).join(' '), aj = at.map(phon).join(' ');
+    if (tj === aj || charRatio(tj, aj) >= 0.72) return true;
+    const sig = tt.filter((t) => !STOP.has(t));
+    const sigA = at.filter((t) => !STOP.has(t));
+    if (!sig.length || !sigA.length) return false;
+    if (charRatio(sig.map(phon).join(' '), sigA.map(phon).join(' ')) >= 0.75) return true;
+    const hits = sig.filter((t) => sigA.some((a) => tokEq(t, a))).length;
+    return hits / sig.length >= 0.7 && sigA.length <= sig.length + 3;
+  }
+  // Titre d'épisode : plusieurs titres acceptés, séparés par "/"
   function judgeEpisode(q, answer) {
     const ans = String(answer || '').trim();
     if (!ans) return 0;
-    if (q.n) {
-      const ec = parseCode(q.n), ac = parseCode(ans);
-      if (ec && ac && ec[0] === ac[0] && ec[1] === ac[1]) return 1;
-    }
-    const tt = toks(q.e), at = toks(ans);
-    if (!tt.length || !at.length) return 0;
-    const tj = tt.join(' '), aj = at.join(' ');
-    if (tj === aj || charRatio(tj, aj) >= 0.75) return 1;
-    const sig = tt.filter((t) => !STOP.has(t));
-    const sigA = at.filter((t) => !STOP.has(t));
-    if (sig.length && sigA.length) {
-      if (charRatio(sig.join(' '), sigA.join(' ')) >= 0.8) return 1;
-      const hits = sig.filter((t) => sigA.some((a) => tokEq(t, a))).length;
-      if (hits / sig.length >= 0.75 && sigA.length <= sig.length + 3) return 1;
-    }
-    return 0;
+    return String(q.e || '').split('/').map((x) => x.trim()).filter(Boolean).some((t) => matchTitle(t, ans)) ? 1 : 0;
   }
 
   /* =========================================================
-     YouTube et temps
+     YouTube : liens et temps
      ========================================================= */
   function parseT(v) {
     if (/^\d+$/.test(v)) return +v;
@@ -218,15 +240,217 @@
     const t = s.match(/[?&#](?:t|start)=([0-9hms]+)/);
     return { id: m[1], t: t ? parseT(t[1]) : null };
   }
+  // "1:23.4", "1:23,4", "83.4", "1:02:03" ; null si vide, NaN si illisible
   function parseClock(v) {
-    v = String(v == null ? '' : v).trim();
+    v = String(v == null ? '' : v).trim().replace(',', '.');
     if (!v) return null;
-    if (/^\d+$/.test(v)) return +v;
-    const m = v.match(/^(\d+)[:h'.](\d{1,2})(?:[:'.](\d{1,2}))?$/);
-    if (!m) return NaN;
-    return m[3] != null ? (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) : (+m[1]) * 60 + (+m[2]);
+    if (/^\d+(\.\d+)?$/.test(v)) return +v;
+    let m = v.match(/^(\d+):(\d{1,2}(?:\.\d+)?)$/);
+    if (m) return (+m[1]) * 60 + (+m[2]);
+    m = v.match(/^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/);
+    if (m) return (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]);
+    return NaN;
   }
-  const fmtClock = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  function fmtClock(s) {
+    s = Math.max(0, r1(s));
+    const m = Math.floor(s / 60);
+    return m + ':' + (s - m * 60).toFixed(1).padStart(4, '0');
+  }
+  const validTime = (v) => v != null && !Number.isNaN(v);
+
+  /* =========================================================
+     Lecteur YouTube officiel piloté par l'API (rien n'est hébergé ici)
+     ========================================================= */
+  let ytP = null;
+  function ytReady() {
+    if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+    if (!ytP) {
+      ytP = new Promise((res, rej) => {
+        const prev = window.onYouTubeIframeAPIReady;
+        window.onYouTubeIframeAPIReady = () => { if (prev) prev(); res(window.YT); };
+        const s = document.createElement('script');
+        s.src = 'https://www.youtube.com/iframe_api';
+        s.onerror = () => { ytP = null; rej(new Error('yt')); };
+        document.head.appendChild(s);
+        setTimeout(() => { if (!(window.YT && window.YT.Player)) { ytP = null; rej(new Error('timeout')); } }, 15000);
+      });
+    }
+    return ytP;
+  }
+
+  const PL = { raw: null, p: null, mode: '', videoId: '', card: -1, token: 0, seg: null, raf: 0, free: false };
+
+  function destroyPlayer() {
+    segStop();
+    PL.token++;
+    if (PL.raw) { try { PL.raw.destroy(); } catch (e) { /* déjà parti */ } }
+    PL.raw = null;
+    PL.p = null;
+    PL.card = -1;
+    PL.videoId = '';
+  }
+
+  async function mountPlayer(slotId, videoId, mode, onReady, card) {
+    destroyPlayer();
+    const token = PL.token;
+    PL.card = card == null ? -1 : card;
+    let YT;
+    try { YT = await ytReady(); } catch (e) {
+      const s = document.getElementById(slotId);
+      if (s) s.innerHTML = '<div class="yt-wait">Impossible de charger YouTube. Vérifie ta connexion puis recharge la page.</div>';
+      return;
+    }
+    if (token !== PL.token) return;
+    const slot = document.getElementById(slotId);
+    if (!slot) return;
+    slot.innerHTML = '';
+    const host = document.createElement('div');
+    slot.appendChild(host);
+    PL.mode = mode;
+    PL.videoId = videoId;
+    const edit = mode === 'edit';
+    PL.raw = new YT.Player(host, {
+      host: 'https://www.youtube-nocookie.com',
+      videoId,
+      width: '100%',
+      height: '100%',
+      playerVars: {
+        controls: edit ? 1 : 0, rel: 0, playsinline: 1, modestbranding: 1, iv_load_policy: 3,
+        fs: 0, disablekb: edit ? 0 : 1, cc_load_policy: 0, origin: location.origin
+      },
+      events: {
+        onReady: () => {
+          if (token !== PL.token) return;
+          PL.p = PL.raw;
+          if (!edit) { try { PL.p.unloadModule('captions'); } catch (e) { /* pas de sous-titres */ } }
+          if (onReady) onReady(PL.p);
+        },
+        onStateChange: (e) => { if (token === PL.token) onPlayerState(e.data); },
+        onError: (e) => { if (token === PL.token) onPlayerError(e.data); }
+      }
+    });
+  }
+
+  function segStop() {
+    if (PL.raf) clearTimeout(PL.raf);
+    PL.raf = 0;
+    PL.seg = null;
+  }
+  function onPlayerState(s) {
+    const sg = PL.seg, p = PL.p;
+    if (!p) return;
+    const now = performance.now();
+    // En jeu, jamais de sous-titres : ils donneraient la réplique
+    if (s === 1 && PL.mode === 'game') { try { p.unloadModule('captions'); } catch (e) { /* rien */ } }
+    if (sg && sg.frame) {
+      if (s === 1) frameLand(p, sg);
+      return;
+    }
+    if (sg) {
+      // Le chrono de l'extrait part du vrai démarrage de la lecture
+      if (s === 1 && !sg.playAt) sg.playAt = now;
+      return;
+    }
+    // En jeu, pas de lecture hors des extraits débloqués
+    if (PL.mode === 'game' && s === 1 && !PL.free) {
+      p.pauseVideo();
+      toast('Utilise les boutons d\'extrait sous la vidéo');
+    }
+  }
+  function onPlayerError(code) {
+    segStop();
+    const msg = code === 101 || code === 150 ? 'Cette vidéo ne peut pas être lue ici : supprimée, privée, ou bloquée hors de YouTube par sa chaîne.'
+      : code === 100 ? 'Vidéo introuvable ou privée.' : 'Cette vidéo ne peut pas être lue ici.';
+    if (PL.mode === 'game' && S.quiz) {
+      S.quiz.vidErr = msg;
+      updatePlay();
+    } else if (PL.mode === 'edit') {
+      const box = document.getElementById('ytmsg-' + PL.card);
+      if (box) { box.className = 'yt-msg bad'; box.textContent = msg + ' Choisis une autre vidéo.'; }
+    }
+  }
+  // La vidéo a été chargée au début de la scène (pour pouvoir y revenir sans blocage),
+  // on se place ensuite en pause sur l'image de la coupure.
+  function frameLand(p, sg) {
+    try { p.pauseVideo(); p.seekTo(sg.t, true); } catch (e) { /* rien */ }
+    segStop();
+    setTimeout(() => { try { if (!PL.seg || !PL.seg.frame) p.unMute(); } catch (e) { /* rien */ } }, 400);
+  }
+  function segLoop() {
+    const sg = PL.seg, p = PL.p;
+    if (!sg || !p) return;
+    const now = performance.now();
+    if (sg.frame) {
+      let st = -1;
+      try { st = p.getPlayerState(); } catch (e) { /* rien */ }
+      if ((st === 1 && now - sg.t0 > 600) || now - sg.t0 > 9000) { frameLand(p, sg); return; }
+    } else {
+      const dur = (sg.to - sg.from) * 1000;
+      if (!sg.playAt) {
+        let st = -1;
+        try { st = p.getPlayerState(); } catch (e) { /* rien */ }
+        if (st === 1 && now - sg.t0 > 350) {
+          // événement de lecture manqué : on se fie à l'état lu
+          sg.playAt = now - 100;
+        } else if (!sg.retried && now - sg.t0 > 1800 && PL.videoId) {
+          // lecteur bloqué après un saut (ça arrive en revenant en arrière) : on recharge à l'instant voulu
+          sg.retried = true;
+          sg.t0 = now;
+          try { p.loadVideoById({ videoId: PL.videoId, startSeconds: sg.from }); } catch (e) { /* rien */ }
+        }
+      }
+      // Position lue dans le lecteur : fiable seulement une fois le saut vers le début pris en compte
+      let ct = NaN;
+      try { ct = p.getCurrentTime(); } catch (e) { /* rien */ }
+      if (!sg.ctOk && Math.abs(ct - sg.from) <= 0.3 && (ct !== sg.ct0 || Math.abs(sg.ct0 - sg.from) > 0.3)) sg.ctOk = true;
+      let over = false;
+      if (sg.playAt) over = now - sg.playAt >= dur - 25 || (sg.ctOk && ct >= sg.to - 0.04);
+      if (over) {
+        p.pauseVideo();
+        const cb = sg.cb;
+        segStop();
+        if (cb) cb();
+        return;
+      }
+      if (now - sg.t0 > dur + 15000) { p.pauseVideo(); segStop(); return; }
+    }
+    PL.raf = setTimeout(segLoop, 10);
+  }
+  // Joue exactement [from, to] puis met en pause (chronométré à partir du vrai démarrage)
+  function playSeg(from, to, cb) {
+    const p = PL.p;
+    if (!p) { toast('La vidéo charge encore, réessaie dans une seconde'); return; }
+    segStop();
+    let ct0 = NaN;
+    try { ct0 = p.getCurrentTime(); } catch (e) { /* rien */ }
+    PL.seg = { from, to: Math.max(to, from + 0.05), cb, t0: performance.now(), playAt: 0, ct0 };
+    try {
+      if (p.getPlayerState() === 1) p.pauseVideo();
+      p.unMute();
+      p.seekTo(from, true);
+      p.playVideo();
+    } catch (e) { /* rien */ }
+    PL.raf = setTimeout(segLoop, 10);
+  }
+  // Image figée à l'instant t. Pour une nouvelle scène : chargement muet au début de la scène
+  // (from), puis pause et saut vers t dès que la lecture démarre.
+  function showFrame(t, videoId, from) {
+    const p = PL.p;
+    if (!p) return;
+    segStop();
+    try {
+      if (videoId) {
+        PL.seg = { frame: true, t, t0: performance.now() };
+        PL.videoId = videoId;
+        p.mute();
+        p.loadVideoById({ videoId, startSeconds: from != null && from < t ? from : t });
+        PL.raf = setTimeout(segLoop, 10);
+      } else {
+        p.pauseVideo();
+        p.seekTo(t, true);
+      }
+    } catch (e) { /* rien */ }
+  }
 
   /* =========================================================
      Lien de quiz : tout est dans l'URL (compressé)
@@ -271,18 +495,27 @@
     return JSON.parse(new TextDecoder().decode(out));
   }
   function cleanQuiz(d) {
-    if (!d || !Array.isArray(d.q)) throw new Error('vide');
-    const q = d.q.slice(0, 40).map((x) => ({
-      p: str(x.p, 400),
-      r: str(x.r, 500),
-      e: str(x.e, 140),
-      n: str(x.n, 24),
-      y: /^[A-Za-z0-9_-]{11}$/.test(x.y || '') ? x.y : '',
-      st: num(x.st),
-      en: num(x.en)
-    })).filter((x) => x.r && x.e);
+    if (!d || d.v !== 2 || !Array.isArray(d.q)) throw new Error(d && d.v === 1 ? 'v1' : 'vide');
+    const q = d.q.slice(0, 40).map((x) => {
+      const c = timeOrNull(x.c);
+      if (c == null) return null;
+      let a = timeOrNull(x.a);
+      if (a == null || a >= c) a = Math.max(0, r1(c - 8));
+      let z = timeOrNull(x.z);
+      if (z != null && z <= c) z = null;
+      return {
+        y: /^[A-Za-z0-9_-]{11}$/.test(x.y || '') ? x.y : '',
+        a, c, z,
+        r: str(x.r, 500),
+        e: str(x.e, 200),
+        s: intOrNull(x.s),
+        n: intOrNull(x.n)
+      };
+    }).filter((x) => x && x.y && x.r && x.e);
     if (!q.length) throw new Error('vide');
-    const c = d.c && typeof d.c.n === 'string' && d.c.n.trim() ? { n: str(d.c.n, 30), p: clamp(Math.round(+d.c.p || 0), 0, 100) } : null;
+    const c = d.c && typeof d.c.n === 'string' && d.c.n.trim()
+      ? { n: str(d.c.n, 30), p: clamp(Math.round(+d.c.p || 0), 0, 100), t: Number.isFinite(+d.c.t) && d.c.t != null ? Math.max(0, Math.round(+d.c.t)) : null }
+      : null;
     return { s: str(d.s, 60) || 'Série', a: str(d.a, 40), t: str(d.t, 100), q, c };
   }
   const quizUrl = (code) => location.origin + location.pathname + '#/q/' + code;
@@ -308,6 +541,31 @@
   }
   const saveDuel = () => store.set('tf_duel', S.duel);
 
+  function stagesFor(q) {
+    const L = Math.max(0.2, r1(q.c - q.a));
+    const list = [{ k: 'img', label: 'Image', d: 0 }];
+    STEPS.filter((d) => d < L - 0.05).forEach((d) => list.push({ k: 'x', label: fmtSec(d), d }));
+    list.push({ k: 'full', label: 'Scène', d: L });
+    list.forEach((s, i) => { s.m = i === 0 ? 1 : i === list.length - 1 ? LAST_MULT : MULTS[i]; });
+    return list;
+  }
+  const qMax = (q) => BASE.r + BASE.e + (q.s != null ? BASE.s : 0) + (q.n != null ? BASE.n : 0);
+  function quizTally(res) {
+    const t = { pts: 0, max: 0, n: 0, rf: 0, exact: 0, ef: 0, sn: 0, snMax: 0 };
+    res.forEach((r) => {
+      if (!r || r.skipped) return;
+      t.n++;
+      t.pts += r.pts;
+      t.max += r.max;
+      if (r.r) t.rf++;
+      if (r.r === 2) t.exact++;
+      if (r.e) t.ef++;
+      if (r.hasSN) { t.snMax++; if (r.s && r.n) t.sn++; }
+    });
+    t.pct = t.max ? Math.round(100 * t.pts / t.max) : 0;
+    return t;
+  }
+
   /* =========================================================
      Rendu et navigation
      ========================================================= */
@@ -322,10 +580,11 @@
     if (fresh) window.scrollTo(0, 0); else window.scrollTo(0, y);
     if (after) after();
   }
-  function rerender() { S.route = S.route || ''; render(true); }
+  function rerender() { render(); }
 
   function render() {
     stopChrono();
+    destroyPlayer();
     const h = location.hash.replace(/^#\/?/, '');
     if (h.indexOf('q/') === 0) { renderQuiz(h.slice(2)); return; }
     switch (h) {
@@ -340,7 +599,7 @@
         if (!S.duel) return go('#/duel');
         paint(vDuelEnd(), 'duel/fin', afterVerdict);
         break;
-      case 'creer': paint(vBuilder(), 'creer', afterBuilder); break;
+      case 'creer': paint(vBuilder(), 'creer'); break;
       default: go('#/');
     }
   }
@@ -351,51 +610,57 @@
     t.textContent = msg;
     t.classList.add('show');
     clearTimeout(toastT);
-    toastT = setTimeout(() => t.classList.remove('show'), 2200);
+    toastT = setTimeout(() => t.classList.remove('show'), 2400);
   }
 
   /* =========================================================
      Accueil
      ========================================================= */
+  function multChips() {
+    const st = [['Image', 1]].concat(STEPS.map((d, i) => [fmtSec(d), MULTS[i + 1]])).concat([['Scène', LAST_MULT]]);
+    return '<div class="mults">' + st.map((x) => '<span><b>' + x[0] + '</b><i>' + fmtMult(x[1]) + '</i></span>').join('') + '</div>';
+  }
   function vHome() {
     const d = S.duel;
     const resume = d && !d.done ? '<a class="resume" href="#/duel/jeu"><span>Reprendre le duel en cours · ' + esc(d.serie) + '</span><span aria-hidden="true">→</span></a>' : '';
-    const bounds = [[90, 100], [70, 89], [45, 69], [20, 44], [0, 19]];
     return `
       <section class="hero">
         <p class="kicker">Le blindtest des répliques</p>
         <h1>T'es fan,<br>ou <em>trop fan</em>&nbsp;?</h1>
-        <p class="lead">Un extrait, une réplique à réciter mot pour mot, un épisode à nommer. Deux scores, un verdict.</p>
+        <p class="lead">Une image de la scène, puis 0,1 s, 0,5 s, 1 s… d'extrait. Trouve la réplique qui suit, l'épisode, la saison et le numéro. Plus tôt tu trouves, plus ça rapporte.</p>
       </section>
       ${resume}
       <section class="modes">
+        <a class="mode mode-quiz" href="#/creer">
+          <span class="mode-tag">Vrais extraits YouTube</span>
+          <h2>Crée ton blindtest</h2>
+          <p>Choisis des scènes sur YouTube, coupe juste avant la réplique, envoie le lien. Tes potes ou tes abonnés jouent seuls et doivent battre ton score.</p>
+          <span class="mode-cta">Créer mon blindtest</span>
+        </a>
         <a class="mode mode-duel" href="#/duel">
           <span class="mode-tag">À deux, un seul téléphone</span>
           <h2>Duel en vrai</h2>
           <p>Tu lances un extrait, l'autre récite la réplique et donne l'épisode. Tu notes, le site compte les points et rend le verdict.</p>
           <span class="mode-cta">Lancer un duel</span>
         </a>
-        <a class="mode mode-quiz" href="#/creer">
-          <span class="mode-tag">Chacun sur son écran</span>
-          <h2>Quiz à partager</h2>
-          <p>Écris tes répliques, envoie le lien. Tes potes ou tes abonnés jouent seuls et doivent battre ton score.</p>
-          <span class="mode-cta">Créer mon quiz</span>
-        </a>
       </section>
       <section>
         <h3>Le barème</h3>
         <div class="rule-grid">
           <div class="rule r-line"><span class="rule-name">La réplique</span>
-            <ul><li><b>+2</b> mot pour mot</li><li><b>+1</b> presque</li><li><b>0</b> ratée</li></ul></div>
+            <ul><li><b>500</b> mot pour mot</li><li><b>250</b> presque</li></ul></div>
           <div class="rule r-ep"><span class="rule-name">L'épisode</span>
-            <ul><li><b>+1</b> trouvé</li><li><b>0</b> raté</li></ul></div>
+            <ul><li><b>300</b> le titre</li><li><b>100</b> la saison</li><li><b>100</b> le numéro</li></ul></div>
         </div>
+        <p class="small-note">Multiplié selon l'indice auquel tu trouves :</p>
+        ${multChips()}
+        <p class="small-note">Les fautes d'orthographe sur les noms propres passent. En duel : +2 mot pour mot, +1 presque, +1 l'épisode.</p>
         <h3>Le verdict</h3>
         <ol class="scale">
-          ${LEVELS.map((l, i) => '<li><b>' + esc(l.label) + '</b><span>' + bounds[i][0] + ' à ' + bounds[i][1] + ' %</span></li>').join('')}
+          ${LEVELS.map((l, i) => '<li><b>' + esc(l.label) + '</b><span>' + LEVEL_BOUNDS[i][0] + ' à ' + LEVEL_BOUNDS[i][1] + ' %</span></li>').join('')}
         </ol>
       </section>
-      <p class="foot">Trop Fan n'est lié à aucune série, chaîne ou plateforme. Aucun extrait n'est hébergé ici : les répliques sont écrites par les joueurs et les vidéos restent sur YouTube. Pas de compte, pas de cookies.</p>`;
+      <p class="foot">Trop Fan n'est lié à aucune série, chaîne ou plateforme. Aucune vidéo n'est hébergée ici : les extraits sont lus depuis YouTube avec son lecteur officiel, et chaque blindtest est créé par ses joueurs. Pas de compte, pas de cookies.</p>`;
   }
 
   /* =========================================================
@@ -444,7 +709,8 @@
     if (!serie) {
       const f = document.getElementById('f-serie');
       if (f) { f.classList.add('err-field'); f.focus(); }
-      document.getElementById('setup-err').textContent = 'Choisis une série pour commencer.';
+      const er = document.getElementById('setup-err');
+      if (er) er.textContent = 'Choisis une série pour commencer.';
       return;
     }
     const players = s.players.map((x) => x.trim().slice(0, 24));
@@ -525,8 +791,7 @@
   function afterPlay() { S.bump = null; }
 
   function duelFinish() {
-    const d = S.duel;
-    d.done = true;
+    S.duel.done = true;
     saveDuel();
     SFX.win();
     go('#/duel/fin');
@@ -584,8 +849,15 @@
   }
 
   /* =========================================================
-     Duel : verdict
+     Verdict (duel et quiz)
      ========================================================= */
+  function duelTiles(t) {
+    return [
+      { cls: 's-line', k: 'Répliques', v: t.rp, max: t.rpMax, sub: t.exact + ' mot pour mot · ' + t.close + ' presque', csub: t.exact + ' mot pour mot' },
+      { cls: 's-ep', k: 'Épisodes', v: t.ep, max: t.epMax, sub: t.ep > 1 ? 'trouvés' : 'trouvé' }
+    ];
+  }
+
   function vDuelEnd() {
     const d = S.duel;
     const ts = duelTallies(d);
@@ -602,37 +874,38 @@
       extra = '<ol class="rank">' + sorted.map((t, k) => `<li class="${k === 0 ? 'first' : ''}"><span class="rk">${k + 1}</span><b>${esc(t.name)}</b><em>${t.pct} %</em><small>${t.rp}/${t.rpMax} pts de répliques · ${t.ep}/${t.epMax} épisodes</small></li>`).join('') + '</ol>';
       foot = 'Duel : ' + sorted.map((t) => t.name + ' ' + t.pct + ' %').join(' · ');
     }
-    S.cardData = { who: top.name, serie: d.serie, t: top, foot };
+    const tiles = duelTiles(top);
+    S.cardData = { who: top.name, serie: d.serie, pct: top.pct, tiles, pts: null, foot };
     S.cardText = top.name + ' est « ' + levelFor(top.pct).label + ' » de ' + d.serie + ' (' + top.pct + ' %). Fais le test : ' + location.origin + location.pathname;
     return vVerdict({
       who: top.name,
       whoPrefix: multi ? 'Vainqueur du duel' : 'Le verdict pour',
       serie: d.serie,
-      t: top,
+      pct: top.pct,
+      tiles,
       extra,
       actions: `<div class="stack">
           <button type="button" class="btn" data-act="duel-replay">Rejouer avec les mêmes réglages</button>
-          <a class="btn btn-ghost" href="#/creer">Créer un quiz pour tes abonnés</a>
+          <a class="btn btn-ghost" href="#/creer">Créer un blindtest pour tes abonnés</a>
         </div>`
     });
   }
 
   function vVerdict(o) {
-    const L = levelFor(o.t.pct);
+    const L = levelFor(o.pct);
     return `
       <section class="verdict">
         <p class="kicker">${esc(o.serie)}</p>
         <p class="v-who">${esc(o.whoPrefix)} <b>${esc(o.who)}</b></p>
         <h1 class="v-level">${esc(L.label)}</h1>
         <p class="v-line">${esc(L.line)}</p>
-        <div class="ring" id="ring" data-p="${o.t.pct}"><span><b>${o.t.pct}</b> %</span></div>
+        <div class="ring" id="ring" data-p="${o.pct}"><span><b>${o.pct}</b> %</span></div>
+        ${o.pts != null ? '<p class="v-pts"><b>' + fmtNum(o.pts) + '</b> points</p>' : ''}
         <div class="stats">
-          <div class="stat s-line"><span class="stat-k">Répliques</span><b>${o.t.rp}<small>/${o.t.rpMax}</small></b><span class="stat-sub">${o.t.exact} mot pour mot · ${o.t.close} presque</span></div>
-          <div class="stat s-ep"><span class="stat-k">Épisodes</span><b>${o.t.ep}<small>/${o.t.epMax}</small></b><span class="stat-sub">${o.t.ep > 1 ? 'trouvés' : 'trouvé'}</span></div>
+          ${o.tiles.map((t) => `<div class="stat ${t.cls}"><span class="stat-k">${esc(t.k)}</span><b>${t.v}<small>/${t.max}</small></b><span class="stat-sub">${esc(t.sub)}</span></div>`).join('')}
         </div>
         ${o.extra || ''}
       </section>
-      ${o.before || ''}
       <section class="share">
         <img class="card-img" id="card-img" alt="Carte du verdict à partager en story">
         <button type="button" class="btn btn-primary" data-act="card-share">Partager la carte</button>
@@ -711,7 +984,7 @@
     c.width = W;
     c.height = H;
     const g = c.getContext('2d');
-    const L = levelFor(o.t.pct);
+    const L = levelFor(o.pct);
 
     g.fillStyle = '#0A0A0D';
     g.fillRect(0, 0, W, H);
@@ -726,11 +999,6 @@
     const lw = g.measureText('TROP ').width;
     g.fillStyle = '#C9F23D';
     g.fillText('FAN', X + lw, 150);
-    g.font = '600 34px ' + F;
-    g.fillStyle = '#9B9AA5';
-    g.textAlign = 'right';
-    g.fillText(SITE, W - X, 146);
-    g.textAlign = 'left';
 
     // série
     g.font = '700 38px ' + F;
@@ -778,36 +1046,44 @@
     wrapLines(g, L.line, CW).slice(0, 2).forEach((ln) => { y += 58; g.fillText(ln, X, y); });
 
     // anneau
-    const cx = W / 2, cy = Math.max(y + 250, 1210), R = 168;
-    g.lineWidth = 34;
+    const hasPts = o.pts != null;
+    const R = 160, cx = W / 2, cy = Math.max(y + 240, 1190);
+    g.lineWidth = 32;
     g.lineCap = 'round';
     g.strokeStyle = 'rgba(255,255,255,0.09)';
     g.beginPath();
     g.arc(cx, cy, R, 0, Math.PI * 2);
     g.stroke();
-    if (o.t.pct > 0) {
+    if (o.pct > 0) {
       g.strokeStyle = '#C9F23D';
       g.beginPath();
-      g.arc(cx, cy, R, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (o.t.pct / 100));
+      g.arc(cx, cy, R, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (o.pct / 100));
       g.stroke();
     }
-    g.textAlign = 'center';
-    g.fillStyle = '#F3F2EE';
-    g.font = '800 128px ' + F;
-    const pw = g.measureText(String(o.t.pct)).width;
-    g.font = '700 54px ' + F;
-    const uw = g.measureText(' %').width;
     g.textAlign = 'left';
+    g.font = '800 124px ' + F;
+    const pw = g.measureText(String(o.pct)).width;
+    g.font = '700 52px ' + F;
+    const uw = g.measureText(' %').width;
     const sx = cx - (pw + uw) / 2;
-    g.font = '800 128px ' + F;
-    g.fillText(String(o.t.pct), sx, cy + 44);
-    g.font = '700 54px ' + F;
+    g.font = '800 124px ' + F;
+    g.fillStyle = '#F3F2EE';
+    g.fillText(String(o.pct), sx, cy + 42);
+    g.font = '700 52px ' + F;
     g.fillStyle = '#9B9AA5';
-    g.fillText(' %', sx + pw, cy + 44);
+    g.fillText(' %', sx + pw, cy + 42);
+
+    if (hasPts) {
+      g.textAlign = 'center';
+      g.font = '800 46px ' + F;
+      g.fillStyle = '#F3F2EE';
+      g.fillText(fmtNum(o.pts) + ' points', cx, cy + R + 76);
+      g.textAlign = 'left';
+    }
 
     // tuiles
-    const ty = cy + R + 80, tw = (CW - 28) / 2, th = 236;
-    const tile = (tx, col, bg, k, v, sub) => {
+    const ty = cy + R + (hasPts ? 116 : 80), tw = (CW - 28) / 2, th = 236;
+    const tile = (tx, col, bg, t) => {
       rr(g, tx, ty, tw, th, 34);
       g.fillStyle = bg;
       g.fill();
@@ -818,23 +1094,23 @@
       g.globalAlpha = 1;
       g.font = '700 32px ' + F;
       g.fillStyle = col;
-      g.fillText(k, tx + 34, ty + 62);
+      g.fillText(t.k.toUpperCase(), tx + 34, ty + 62);
       g.font = '800 96px ' + F;
       g.fillStyle = '#F3F2EE';
-      g.fillText(v, tx + 34, ty + 160);
+      g.fillText(t.v + '/' + t.max, tx + 34, ty + 160, tw - 60);
       g.font = '500 32px ' + F;
       g.fillStyle = '#9B9AA5';
-      g.fillText(sub, tx + 34, ty + 208, tw - 60);
+      g.fillText(t.csub || t.sub, tx + 34, ty + 208, tw - 60);
     };
-    tile(X, '#C9F23D', 'rgba(201,242,61,0.08)', 'RÉPLIQUES', o.t.rp + '/' + o.t.rpMax, o.t.exact + ' mot pour mot');
-    tile(X + tw + 28, '#FF6FA0', 'rgba(255,111,160,0.08)', 'ÉPISODES', o.t.ep + '/' + o.t.epMax, o.t.ep > 1 ? 'trouvés' : 'trouvé');
+    tile(X, '#C9F23D', 'rgba(201,242,61,0.08)', o.tiles[0]);
+    tile(X + tw + 28, '#FF6FA0', 'rgba(255,111,160,0.08)', o.tiles[1]);
 
     // ligne bonus (défi, classement)
     if (o.foot) {
       g.font = '700 38px ' + F;
       g.fillStyle = '#F3F2EE';
       g.textAlign = 'center';
-      g.fillText(o.foot, W / 2, ty + th + 82, CW);
+      g.fillText(o.foot, W / 2, ty + th + 72, CW);
     }
 
     // pied
@@ -851,10 +1127,10 @@
     const fx = (W - fw - hw) / 2;
     g.font = '600 ' + fs + 'px ' + F;
     g.fillStyle = '#9B9AA5';
-    g.fillText(ft, fx, H - 74);
+    g.fillText(ft, fx, H - 70);
     g.font = '800 ' + fs + 'px ' + F;
     g.fillStyle = '#C9F23D';
-    g.fillText(SITE, fx + fw, H - 74);
+    g.fillText(SITE, fx + fw, H - 70);
     return c;
   }
 
@@ -927,25 +1203,25 @@
   }
 
   /* =========================================================
-     Créer un quiz
+     Créer un blindtest (éditeur avec lecteur YouTube)
      ========================================================= */
-  const newQ = () => ({ p: '', r: '', e: '', n: '', y: '', st: '', en: '' });
+  const newQ = () => ({ y: '', a: '', c: '', z: '', r: '', e: '', s: '', n: '' });
   function draft() {
-    if (!S.draft) S.draft = { serie: '', author: '', title: '', qs: [newQ(), newQ(), newQ()] };
+    if (!S.draft || S.draft.v !== 2) S.draft = { v: 2, serie: '', author: '', title: '', qs: [newQ(), newQ(), newQ()] };
     return S.draft;
   }
   let draftT = null;
   function saveDraft() {
     clearTimeout(draftT);
-    draftT = setTimeout(() => store.set('tf_draft', S.draft), 300);
+    draftT = setTimeout(() => store.set('tf_draft2', S.draft), 300);
   }
 
   function vBuilder() {
     const B = draft();
     return `
-      <p class="kicker" style="margin-top:18px">Mode quiz</p>
-      <h1 class="page-title">Crée ton quiz</h1>
-      <p class="page-sub">Pour chaque réplique : ce que le joueur voit, la réplique exacte à trouver et l'épisode. Tout tient dans le lien, rien n'est stocké chez nous.</p>
+      <p class="kicker" style="margin-top:18px">Vrais extraits YouTube</p>
+      <h1 class="page-title">Crée ton blindtest</h1>
+      <p class="page-sub">Pour chaque réplique : une scène sur YouTube, l'instant juste avant la réplique, puis la réplique, le titre, la saison et le numéro de l'épisode. Les joueurs verront d'abord l'image, puis 0,1 s, 0,5 s, 1 s, 2 s, 4 s et toute la scène.</p>
 
       <label class="field"><span>La série</span>
         <input id="b-serie" data-bind="b" data-f="serie" value="${esc(B.serie)}" placeholder="Ex. : Rick et Morty" maxlength="40" autocomplete="off"></label>
@@ -955,59 +1231,128 @@
         <label class="field"><span>Titre (optionnel)</span>
           <input data-bind="b" data-f="title" value="${esc(B.title)}" placeholder="Le blindtest de…" maxlength="90" autocomplete="off"></label>
       </div>
+      <p class="tip warn"><b>Bon à savoir :</b> le lecteur YouTube affiche le titre de la vidéo. Choisis des vidéos dont le titre ne donne pas l'épisode. Si une chaîne interdit la lecture hors de YouTube, le site te prévient.</p>
 
       <div id="qlist">${B.qs.map(vQCard).join('')}</div>
       ${B.qs.length < 30 ? '<button type="button" class="btn btn-ghost add" data-act="q-add">+ Ajouter une réplique</button>' : ''}
 
       <p class="form-err" id="build-err"></p>
-      <div class="stack"><button type="button" class="btn btn-pink" data-act="build">Générer le lien du quiz</button></div>
+      <div class="stack"><button type="button" class="btn btn-pink" data-act="build">Générer le lien du blindtest</button></div>
       <div id="build-out"></div>
-      <p class="tip"><b>Astuce :</b> fais jouer ton quiz à quelqu'un. À la fin, son bouton « Créer mon lien défi » donne un lien avec son score à battre. C'est celui-là qu'il faut poster.</p>
+      <p class="tip"><b>Astuce :</b> fais jouer ton blindtest à quelqu'un. À la fin, son bouton « Créer mon lien défi » donne un lien avec son score à battre. C'est celui-là qu'il faut poster.</p>
       <button type="button" class="link-btn" data-act="draft-reset">Tout effacer</button>`;
   }
 
+  function ytMsg(q) {
+    if (!q.y.trim()) return { c: '', t: 'Colle le lien d\'une scène de la série.' };
+    const y = parseYT(q.y);
+    if (!y) return { c: 'bad', t: 'Lien YouTube non reconnu.' };
+    const c = parseClock(q.c), a = parseClock(q.a), z = parseClock(q.z);
+    if ([c, a, z].some((v) => Number.isNaN(v))) return { c: 'bad', t: 'Temps au format 1:23.4 ou en secondes.' };
+    if (c == null) return { c: 'ok', t: 'Vidéo reconnue. Ouvre-la, mets pause juste avant la réplique, puis appuie sur « Ici ».' };
+    const start = a != null ? a : Math.max(0, c - 8);
+    if (start >= c) return { c: 'bad', t: 'Le début de la scène doit venir avant la coupure.' };
+    if (z != null && z <= c) return { c: 'bad', t: 'La fin de la réplique doit venir après la coupure.' };
+    return { c: 'ok', t: 'Scène de ' + fmtClock(start) + ' à ' + fmtClock(c) + ' (' + fmtSec(r1(c - start)) + '), puis la réplique.' };
+  }
+
   function vQCard(q, i) {
-    const yt = ytMsg(q);
+    const y = parseYT(q.y);
+    const m = ytMsg(q);
+    const f = (k) => 'data-bind="q" data-f="' + k + '" data-i="' + i + '"';
     return `
-      <div class="qcard" data-qi="${i}">
+      <div class="qcard" id="qc-${i}">
         <div class="qcard-h"><span>Réplique ${i + 1}</span>${draft().qs.length > 1 ? '<button type="button" data-act="q-del" data-i="' + i + '">Supprimer</button>' : ''}</div>
-        <label class="field"><span>Ce que le joueur voit</span>
-          <textarea data-bind="q" data-f="p" data-i="${i}" rows="2" maxlength="400" placeholder="Le début de la réplique, ou qui parle et dans quelle scène">${esc(q.p)}</textarea></label>
-        <label class="field"><span>La réplique à trouver, mot pour mot</span>
-          <textarea data-bind="q" data-f="r" data-i="${i}" rows="2" maxlength="500" placeholder="La suite exacte, telle qu'elle est dite">${esc(q.r)}</textarea></label>
-        <div class="row2">
-          <label class="field"><span>L'épisode</span>
-            <input data-bind="q" data-f="e" data-i="${i}" value="${esc(q.e)}" maxlength="140" placeholder="Titre de l'épisode" autocomplete="off"></label>
-          <label class="field"><span>Numéro</span>
-            <input data-bind="q" data-f="n" data-i="${i}" value="${esc(q.n)}" maxlength="24" placeholder="S1E5" autocomplete="off"></label>
+        <label class="field"><span>Lien YouTube de la scène</span>
+          <input ${f('y')} value="${esc(q.y)}" placeholder="https://youtu.be/…" inputmode="url" autocomplete="off"></label>
+        <p class="yt-msg ${m.c}" id="ytmsg-${i}">${esc(m.t)}</p>
+        <div class="yt-embed ed" id="ed-slot-${i}" hidden></div>
+        <button type="button" class="btn btn-sm ed-open" data-act="ed-open" data-i="${i}" id="ed-open-${i}"${y ? '' : ' hidden'}>Ouvrir la vidéo pour régler les temps</button>
+
+        <div class="trow">
+          <label class="field"><span>Coupure : juste avant la réplique</span>
+            <input ${f('c')} value="${esc(q.c)}" placeholder="1:23.4" autocomplete="off"></label>
+          <button type="button" class="btn btn-sm now" data-act="t-now" data-f="c" data-i="${i}">Ici</button>
         </div>
-        <details class="yt"${q.y ? ' open' : ''}>
-          <summary>Extrait YouTube (optionnel)</summary>
-          <label class="field"><span>Lien de la vidéo</span>
-            <input data-bind="q" data-f="y" data-i="${i}" value="${esc(q.y)}" placeholder="https://youtu.be/…" inputmode="url" autocomplete="off"></label>
-          <div class="row2 even">
-            <label class="field"><span>Début</span>
-              <input data-bind="q" data-f="st" data-i="${i}" value="${esc(q.st)}" placeholder="1:23" autocomplete="off"></label>
-            <label class="field"><span>Fin</span>
-              <input data-bind="q" data-f="en" data-i="${i}" value="${esc(q.en)}" placeholder="1:31" autocomplete="off"></label>
-          </div>
-          <p class="yt-msg ${yt.c}" id="ytmsg-${i}">${esc(yt.t)}</p>
-        </details>
+        <div class="nudge">
+          <button type="button" data-act="t-nudge" data-d="-0.5" data-i="${i}">-0,5 s</button>
+          <button type="button" data-act="t-nudge" data-d="-0.1" data-i="${i}">-0,1 s</button>
+          <button type="button" data-act="t-nudge" data-d="0.1" data-i="${i}">+0,1 s</button>
+          <button type="button" data-act="t-nudge" data-d="0.5" data-i="${i}">+0,5 s</button>
+          <button type="button" class="t-test" data-act="t-test" data-k="cut" data-i="${i}">▶ Jusqu'à la coupure</button>
+          <button type="button" class="t-test" data-act="t-test" data-k="line" data-i="${i}">▶ La réplique</button>
+        </div>
+        <div class="trow">
+          <label class="field"><span>Début de la scène</span>
+            <input ${f('a')} value="${esc(q.a)}" placeholder="Par défaut : 8 s avant la coupure" autocomplete="off"></label>
+          <button type="button" class="btn btn-sm now" data-act="t-now" data-f="a" data-i="${i}">Ici</button>
+        </div>
+        <div class="trow">
+          <label class="field"><span>Fin de la réplique (pour la révélation)</span>
+            <input ${f('z')} value="${esc(q.z)}" placeholder="Optionnel" autocomplete="off"></label>
+          <button type="button" class="btn btn-sm now" data-act="t-now" data-f="z" data-i="${i}">Ici</button>
+        </div>
+
+        <label class="field"><span>La réplique qui suit, mot pour mot</span>
+          <textarea ${f('r')} rows="2" maxlength="500" placeholder="Telle qu'elle est dite dans la scène">${esc(q.r)}</textarea></label>
+        <label class="field"><span>Titre de l'épisode</span>
+          <input ${f('e')} value="${esc(q.e)}" maxlength="200" placeholder="Plusieurs titres acceptés : sépare-les par /" autocomplete="off"></label>
+        <div class="row2 even">
+          <label class="field"><span>Saison</span>
+            <input ${f('s')} value="${esc(q.s)}" maxlength="3" inputmode="numeric" placeholder="3" autocomplete="off"></label>
+          <label class="field"><span>Épisode n°</span>
+            <input ${f('n')} value="${esc(q.n)}" maxlength="3" inputmode="numeric" placeholder="7" autocomplete="off"></label>
+        </div>
       </div>`;
   }
 
-  function ytMsg(q) {
-    if (!q.y.trim()) return { c: '', t: "Coupe l'extrait juste avant la réplique : le joueur doit la trouver seul." };
-    const y = parseYT(q.y);
-    if (!y) return { c: 'bad', t: 'Lien YouTube non reconnu.' };
-    const st = parseClock(q.st), en = parseClock(q.en);
-    if (Number.isNaN(st) || Number.isNaN(en)) return { c: 'bad', t: 'Temps au format 1:23 ou en secondes.' };
-    const s = st != null ? st : (y.t || 0);
-    if (en != null && en <= s) return { c: 'bad', t: 'La fin doit venir après le début.' };
-    return { c: 'ok', t: 'Extrait reconnu : de ' + fmtClock(s) + (en != null ? ' à ' + fmtClock(en) : " jusqu'au bout") + '.' };
+  function refreshYtMsg(i) {
+    const q = draft().qs[i];
+    const box = document.getElementById('ytmsg-' + i);
+    if (!q || !box) return;
+    const m = ytMsg(q);
+    box.className = 'yt-msg ' + m.c;
+    box.textContent = m.t;
   }
-
-  function afterBuilder() { /* rien à faire, les champs sont reliés par délégation */ }
+  function setQField(i, k, v) {
+    const q = draft().qs[i];
+    if (!q) return;
+    q[k] = v;
+    const el = document.querySelector('[data-bind="q"][data-f="' + k + '"][data-i="' + i + '"]');
+    if (el) { el.value = v; el.classList.remove('err-field'); }
+    saveDraft();
+    refreshYtMsg(i);
+  }
+  function closeEditors() {
+    document.querySelectorAll('.yt-embed.ed').forEach((el) => { el.hidden = true; el.innerHTML = ''; });
+    draft().qs.forEach((q, i) => {
+      const b = document.getElementById('ed-open-' + i);
+      if (b) b.hidden = !parseYT(q.y);
+    });
+  }
+  function openEditor(i) {
+    const q = draft().qs[i];
+    const y = parseYT(q.y);
+    if (!y) return;
+    destroyPlayer();
+    closeEditors();
+    const slot = document.getElementById('ed-slot-' + i);
+    const btn = document.getElementById('ed-open-' + i);
+    if (!slot) return;
+    slot.hidden = false;
+    slot.innerHTML = '<div class="yt-wait">Chargement de la vidéo…</div>';
+    if (btn) btn.hidden = true;
+    const c = parseClock(q.c);
+    const t = validTime(c) ? c : (y.t || 0);
+    mountPlayer('ed-slot-' + i, y.id, 'edit', (p) => {
+      if (t) p.cueVideoById({ videoId: y.id, startSeconds: t });
+    }, i);
+  }
+  function editorFor(i) {
+    if (PL.p && PL.mode === 'edit' && PL.card === i) return PL.p;
+    toast('Ouvre d\'abord la vidéo de cette réplique');
+    return null;
+  }
 
   function onInput(e) {
     const el = e.target;
@@ -1030,24 +1375,24 @@
       const i = +el.dataset.i;
       const q = draft().qs[i];
       if (!q) return;
-      q[el.dataset.f] = el.value;
-      if (el.dataset.f === 'y' && !q.st.trim()) {
+      const k = el.dataset.f;
+      q[k] = el.value;
+      if (k === 'y') {
+        if (PL.mode === 'edit' && PL.card === i) { destroyPlayer(); closeEditors(); }
         const y = parseYT(el.value);
-        if (y && y.t) {
-          q.st = fmtClock(y.t);
-          const stIn = document.querySelector('[data-bind="q"][data-f="st"][data-i="' + i + '"]');
-          if (stIn) stIn.value = q.st;
-        }
-      }
-      if (['y', 'st', 'en'].indexOf(el.dataset.f) >= 0) {
-        const m = ytMsg(q);
-        const box = document.getElementById('ytmsg-' + i);
-        if (box) { box.className = 'yt-msg ' + m.c; box.textContent = m.t; }
+        const b = document.getElementById('ed-open-' + i);
+        if (b && !(PL.mode === 'edit' && PL.card === i)) b.hidden = !y;
+        if (y && y.t && !q.c.trim()) setQField(i, 'c', fmtClock(y.t));
       }
       saveDraft();
+      refreshYtMsg(i);
     } else if (bind === 'qname') {
       if (S.quiz) S.quiz.name = el.value;
       store.set('tf_name', el.value);
+    } else if (bind === 'qa') {
+      if (S.quiz && S.quiz.T) S.quiz.T[el.dataset.f] = el.value;
+      const box = el.closest('.ans');
+      if (box) box.classList.remove('wrong');
     }
   }
 
@@ -1068,7 +1413,7 @@
     const mark = (sel) => { const el = document.querySelector(sel); if (el) el.classList.add('err-field'); return el; };
 
     if (!B.serie.trim()) {
-      err.textContent = 'Indique la série du quiz.';
+      err.textContent = 'Indique la série du blindtest.';
       const el = mark('#b-serie');
       if (el) el.focus();
       return;
@@ -1076,26 +1421,26 @@
     const problems = [];
     const qs = [];
     B.qs.forEach((q, i) => {
-      const filled = ['p', 'r', 'e', 'n', 'y'].some((k) => q[k].trim());
+      const filled = Object.keys(q).some((k) => String(q[k]).trim());
       if (!filled) return;
-      const sel = (f) => '[data-bind="q"][data-f="' + f + '"][data-i="' + i + '"]';
-      const y = q.y.trim() ? parseYT(q.y) : null;
+      const sel = (k) => '[data-bind="q"][data-f="' + k + '"][data-i="' + i + '"]';
+      const y = parseYT(q.y);
+      const c = parseClock(q.c), a = parseClock(q.a), z = parseClock(q.z);
       const miss = [];
+      if (!y) { miss.push('un lien YouTube valide'); mark(sel('y')); }
+      if (!validTime(c)) { miss.push('la coupure'); mark(sel('c')); }
+      if (Number.isNaN(a) || (validTime(a) && validTime(c) && a >= c)) { miss.push('un début avant la coupure'); mark(sel('a')); }
+      if (Number.isNaN(z) || (validTime(z) && validTime(c) && z <= c)) { miss.push('une fin après la coupure'); mark(sel('z')); }
       if (!q.r.trim()) { miss.push('la réplique'); mark(sel('r')); }
-      if (!q.e.trim()) { miss.push("l'épisode"); mark(sel('e')); }
-      if (!q.p.trim() && !y) { miss.push('ce que le joueur voit (ou un extrait)'); mark(sel('p')); }
-      if (q.y.trim() && !y) { miss.push('un lien YouTube valide'); mark(sel('y')); }
-      const st = parseClock(q.st), en = parseClock(q.en);
-      if (y && (Number.isNaN(st) || Number.isNaN(en))) { miss.push('des temps valides'); mark(sel('st')); }
+      if (!q.e.trim()) { miss.push('le titre de l\'épisode'); mark(sel('e')); }
+      if (q.s.trim() && intOrNull(q.s) == null) { miss.push('une saison en chiffres'); mark(sel('s')); }
+      if (q.n.trim() && intOrNull(q.n) == null) { miss.push('un numéro en chiffres'); mark(sel('n')); }
       if (miss.length) { problems.push('Réplique ' + (i + 1) + ' : il manque ' + miss.join(', ') + '.'); return; }
-      const o = { r: q.r.trim(), e: q.e.trim() };
-      if (q.p.trim()) o.p = q.p.trim();
-      if (q.n.trim()) o.n = q.n.trim();
-      if (y) {
-        o.y = y.id;
-        if (st != null) o.st = st; else if (y.t) o.st = y.t;
-        if (en != null && en > (o.st || 0)) o.en = en;
-      }
+      const o = { y: y.id, c: r1(c), r: q.r.trim(), e: q.e.trim() };
+      if (validTime(a)) o.a = r1(a);
+      if (validTime(z)) o.z = r1(z);
+      if (intOrNull(q.s) != null) o.s = intOrNull(q.s);
+      if (intOrNull(q.n) != null) o.n = intOrNull(q.n);
       qs.push(o);
     });
     if (problems.length) {
@@ -1106,7 +1451,7 @@
       err.textContent = 'Ajoute au moins une réplique.';
       return;
     }
-    const data = { v: 1, s: B.serie.trim(), q: qs };
+    const data = { v: 2, s: B.serie.trim(), q: qs };
     if (B.author.trim()) data.a = B.author.trim();
     if (B.title.trim()) data.t = B.title.trim();
     const code = await encodeQuiz(data);
@@ -1114,178 +1459,327 @@
     out.innerHTML = `<h3>Ton lien est prêt</h3>
       <p class="page-sub">${plural(qs.length, 'réplique')}. Envoie-le, mets-le en bio ou en story.</p>
       ${linkBox(url, 'Mon blindtest ' + data.s + ' : t\'es fan, ou trop fan ?')}
-      <a class="btn btn-ghost" style="margin-top:8px" href="${esc(url)}">Tester mon quiz</a>`;
+      <a class="btn btn-ghost" style="margin-top:8px" href="${esc(url)}">Tester mon blindtest</a>`;
     out.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   /* =========================================================
-     Jouer à un quiz
+     Jouer à un blindtest
      ========================================================= */
+  function newRound(Q) {
+    Q.stage = 0;
+    Q.F = {};
+    Q.T = { r: '', e: '', s: '', n: '' };
+    Q.wrong = {};
+    Q.tries = {};
+    Q.vidErr = '';
+  }
+
   async function renderQuiz(code) {
     if (!S.quiz || S.quiz.key !== code) {
       S.quiz = { key: code, loading: true };
-      paint('<div class="center-msg"><p>Chargement du quiz…</p></div>', 'q-load');
+      paint('<div class="center-msg"><p>Chargement du blindtest…</p></div>', 'q-load');
       try {
         const raw = await decodeQuiz(code);
         const data = cleanQuiz(raw);
         delete raw.c;
         S.quiz = { key: code, raw, data, phase: 'intro', idx: 0, res: [], name: store.get('tf_name', '') || '' };
+        newRound(S.quiz);
       } catch (e) {
-        S.quiz = { key: code, error: e && e.message === 'old' ? 'old' : 'bad' };
+        S.quiz = { key: code, error: e && (e.message === 'old' || e.message === 'v1') ? e.message : 'bad' };
       }
       if (S.quiz.key !== code || location.hash.replace(/^#\/?/, '') !== 'q/' + code) return;
     }
     const Q = S.quiz;
     if (Q.loading) return;
     if (Q.error) {
-      paint(`<div class="center-msg"><h1 class="page-title">Lien illisible</h1>
-        <p>${Q.error === 'old' ? 'Ton navigateur est trop ancien pour ouvrir ce quiz. Essaie avec Chrome ou Safari à jour.' : 'Ce lien de quiz est cassé ou incomplet. Demande-le à nouveau à la personne qui te l\'a envoyé.'}</p>
+      const why = Q.error === 'old' ? 'Ton navigateur est trop ancien pour ouvrir ce blindtest. Essaie avec Chrome ou Safari à jour.'
+        : Q.error === 'v1' ? 'Ce lien vient de l\'ancienne version du site, sans extraits vidéo. Demande un nouveau lien à son créateur.'
+          : 'Ce lien est cassé ou incomplet. Demande-le à nouveau à la personne qui te l\'a envoyé.';
+      paint(`<div class="center-msg"><h1 class="page-title">Lien illisible</h1><p>${why}</p>
         <div class="stack"><a class="btn btn-primary" href="#/">Découvrir Trop Fan</a></div></div>`, 'q-err');
       return;
     }
-    const key = 'q-' + Q.phase + '-' + Q.idx;
-    if (Q.phase === 'intro') paint(vQuizIntro(), key);
-    else if (Q.phase === 'q') paint(vQuizQ(), key);
-    else if (Q.phase === 'reveal') paint(vQuizReveal(), key);
-    else paint(vQuizEnd(), key, afterVerdict);
+    if (Q.phase === 'intro') paint(vQuizIntro(), 'q-intro');
+    else if (Q.phase === 'end') paint(vQuizEnd(), 'q-end', afterVerdict);
+    else paintPlay();
   }
 
   function vQuizIntro() {
     const { data, name } = S.quiz;
     const title = data.t || ('Le blindtest ' + data.s + (data.a ? ' de ' + data.a : ''));
+    const c = data.c;
     return `
       <p class="kicker" style="margin-top:18px">${esc(data.s)}</p>
       <h1 class="page-title">${esc(title)}</h1>
-      <p class="page-sub">${data.a ? 'Par ' + esc(data.a) + ' · ' : ''}${plural(data.q.length, 'réplique')} à trouver</p>
-      ${data.c ? `<div class="beat"><div><span>Score à battre</span><br><b>${esc(data.c.n)}</b></div><strong>${data.c.p} %</strong></div>` : ''}
-      <div class="rule-grid" style="margin-top:22px">
-        <div class="rule r-line"><span class="rule-name">La réplique</span><ul><li><b>+2</b> mot pour mot</li><li><b>+1</b> presque</li></ul></div>
-        <div class="rule r-ep"><span class="rule-name">L'épisode</span><ul><li><b>+1</b> titre ou numéro</li><li><b>0</b> raté</li></ul></div>
-      </div>
+      <p class="page-sub">${data.a ? 'Par ' + esc(data.a) + ' · ' : ''}${plural(data.q.length, 'scène')} à reconnaître</p>
+      ${c ? `<div class="beat"><div><span>Score à battre</span><br><b>${esc(c.n)}</b></div><strong>${c.t != null ? fmtNum(c.t) + ' pts' : c.p + ' %'}</strong></div>` : ''}
+      <ol class="how" style="margin-top:20px">
+        <li>Tu vois une image de la scène, juste avant une réplique.</li>
+        <li>Trouve la réplique qui suit, le titre de l'épisode, la saison et le numéro.</li>
+        <li>Bloqué ? Débloque 0,1 s, 0,5 s, 1 s, 2 s, 4 s puis toute la scène. Chaque indice fait baisser les points.</li>
+      </ol>
+      ${multChips()}
       <label class="field"><span>Ton prénom</span>
         <input data-bind="qname" value="${esc(name)}" placeholder="Pour la carte du verdict" maxlength="24" autocomplete="off" enterkeyhint="go"></label>
-      <div class="stack"><button type="button" class="btn btn-primary" data-act="quiz-go">C'est parti</button></div>`;
+      <div class="stack"><button type="button" class="btn btn-primary" data-act="quiz-go">C'est parti, avec le son</button></div>`;
   }
 
-  function ytEmbed(q) {
-    const params = ['rel=0', 'playsinline=1', 'modestbranding=1'];
-    if (q.st != null) params.push('start=' + q.st);
-    if (q.en != null) params.push('end=' + q.en);
-    return 'https://www.youtube-nocookie.com/embed/' + q.y + '?' + params.join('&');
+  function paintPlay() {
+    paint(`<div id="q-head"></div>
+      <div class="yt-embed game" id="yt-slot"><div class="yt-wait">Chargement de la scène…</div></div>
+      <div id="q-dyn"></div>`, 'q-play', () => { updatePlay(); loadQuestionVideo(); });
   }
-
-  function vQuizQ() {
+  function loadQuestionVideo() {
     const Q = S.quiz;
     const q = Q.data.q[Q.idx];
+    PL.free = Q.phase === 'reveal';
+    if (PL.p && PL.mode === 'game') { showFrame(q.c, q.y, q.a); return; }
+    mountPlayer('yt-slot', q.y, 'game', () => { showFrame(q.c, q.y, q.a); });
+  }
+
+  function curPts(F) { return ['r', 'e', 's', 'n'].reduce((a, k) => a + (F[k] ? F[k].pts : 0), 0); }
+
+  function updatePlay() {
+    const Q = S.quiz;
+    const head = document.getElementById('q-head');
+    const dyn = document.getElementById('q-dyn');
+    if (!head || !dyn) { paintPlay(); return; }
     const total = Q.data.q.length;
-    const t = tally(Q.res);
+    const done = Q.res.reduce((a, r) => a + (r ? r.pts : 0), 0) + (Q.phase === 'q' ? curPts(Q.F) : 0);
+    const prog = (Q.idx + (Q.phase === 'reveal' ? 1 : 0)) / total;
+    head.innerHTML = `<div class="progress"><i style="width:${prog * 100}%"></i></div>
+      <div class="q-count"><span>Scène ${Q.idx + 1}/${total}</span><span><b class="pts-live">${fmtNum(done)}</b> pts</span></div>`;
+    dyn.innerHTML = Q.phase === 'reveal' ? vPlayReveal() : vPlayQ();
+  }
+
+  function vPlayQ() {
+    const Q = S.quiz;
+    const q = Q.data.q[Q.idx];
+    const stages = stagesFor(q);
+    const st = stages[Q.stage];
+    const F = Q.F, T = Q.T, W = Q.wrong;
+    const last = Q.stage === stages.length - 1;
+    if (Q.vidErr) {
+      return `<p class="vid-err">${esc(Q.vidErr)}</p>
+        <div class="stack"><button type="button" class="btn btn-primary" data-act="q-skipvid">Passer cette scène</button></div>`;
+    }
+    const chips = stages.map((s, k) => `<button type="button" class="stg${k < Q.stage ? ' used' : ''}${k === Q.stage ? ' cur' : ''}" data-act="stg" data-k="${k}"${k > Q.stage ? ' disabled' : ''} aria-label="${s.label}"><b>${s.label}</b><i>${fmtMult(s.m)}</i></button>`).join('');
+    const info = Q.stage === 0
+      ? 'L\'image juste avant la réplique.'
+      : st.k === 'full' ? 'Toute la scène (' + fmtSec(st.d) + '). Dernière chance.' : 'Extrait de ' + st.label + ' débloqué.';
+    const lockBox = (k, label, val, extra) => `<div class="ans locked"><span class="ans-k">${label}</span><p class="ans-v">${esc(val)}</p><span class="ans-pts">${extra} · +${F[k].pts}</span></div>`;
+    const fieldR = F.r ? lockBox('r', 'La réplique qui suit', F.r.ans, F.r.score === 2 ? 'Mot pour mot' : 'Presque')
+      : `<label class="ans${W.r ? ' wrong' : ''}"><span class="ans-k">La réplique qui suit</span><textarea data-bind="qa" data-f="r" rows="2" maxlength="500" placeholder="Écris-la mot pour mot">${esc(T.r)}</textarea></label>`;
+    const fieldE = F.e ? lockBox('e', 'Le titre de l\'épisode', F.e.ans, 'Trouvé')
+      : `<label class="ans${W.e ? ' wrong' : ''}"><span class="ans-k">Le titre de l'épisode</span><input id="a-ep" data-bind="qa" data-f="e" value="${esc(T.e)}" maxlength="200" placeholder="Le titre, à peu près suffit" autocomplete="off" enterkeyhint="done"></label>`;
+    const small = (k, label) => {
+      if (q[k] == null) return '';
+      if (F[k]) return `<div class="ans locked"><span class="ans-k">${label}</span><p class="ans-v">${q[k]}</p><span class="ans-pts">+${F[k].pts}</span></div>`;
+      return `<label class="ans${W[k] ? ' wrong' : ''}"><span class="ans-k">${label}</span><input data-bind="qa" data-f="${k}" value="${esc(T[k])}" maxlength="3" inputmode="numeric" placeholder="?" autocomplete="off"></label>`;
+    };
+    const sn = small('s', 'Saison') + small('n', 'Épisode n°');
+    const worth = 'Une bonne réponse vaut maintenant : réplique ' + round5(BASE.r * st.m) + ' · titre ' + round5(BASE.e * st.m) +
+      (q.s != null ? ' · saison ' + round5(BASE.s * st.m) : '') + (q.n != null ? ' · numéro ' + round5(BASE.n * st.m) : '');
     return `
-      <div class="progress"><i style="width:${(Q.idx / total) * 100}%"></i></div>
-      <div class="q-count"><span>Réplique ${Q.idx + 1}/${total}</span><span>${t.rp} pts · ${t.ep} ép.</span></div>
-      ${q.y ? `<div class="yt-embed"><iframe id="yt-frame" src="${esc(ytEmbed(q))}" title="Extrait vidéo" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe></div>
-        <button type="button" class="btn btn-ghost replay" data-act="yt-replay">Revoir l'extrait</button>` : ''}
-      ${q.p ? '<blockquote class="prompt">' + esc(q.p) + '</blockquote>' : (q.y ? '' : '<blockquote class="prompt">Trouve la réplique.</blockquote>')}
-      <label class="field"><span>La réplique, mot pour mot</span>
-        <textarea id="a-line" rows="3" maxlength="500" placeholder="Écris la réplique exacte"></textarea></label>
-      <label class="field"><span>L'épisode</span>
-        <input id="a-ep" maxlength="140" placeholder="Titre ou numéro (ex. S2E4)" autocomplete="off" enterkeyhint="done"></label>
+      <div class="stages">${chips}</div>
+      <div class="stage-info"><span>${info}</span><button type="button" class="btn btn-sm" data-act="stg" data-k="${Q.stage}">${Q.stage === 0 ? 'Revoir l\'image' : '▶ Réécouter'}</button></div>
+      ${fieldR}
+      ${fieldE}
+      ${sn ? '<div class="sn-row">' + sn + '</div>' : ''}
       <div class="stack">
-        <button type="button" class="btn btn-primary" data-act="quiz-check">Valider</button>
-        <button type="button" class="btn btn-ghost" data-act="quiz-skip">Je sèche</button>
+        <button type="button" class="btn btn-primary" data-act="q-check">Valider</button>
+        <button type="button" class="btn btn-ghost" data-act="q-pass">${last ? 'Je donne ma langue au chat' : 'Passer : extrait suivant'}</button>
+      </div>
+      <p class="worth">${worth}</p>`;
+  }
+
+  function stageTxt(q, k) {
+    const st = stagesFor(q)[k];
+    return k === 0 ? 'dès l\'image' : st.k === 'full' ? 'avec la scène' : 'à ' + st.label;
+  }
+
+  function vPlayReveal() {
+    const Q = S.quiz;
+    const q = Q.data.q[Q.idx];
+    const F = Q.F;
+    const R = Q.res[Q.idx] || { pts: 0, max: qMax(q) };
+    const last = Q.idx === Q.data.q.length - 1;
+    const row = (cls, k, label, good, txt) => `<div class="verdict-row ${cls}"><span class="vr-k">${label}</span><span class="vr-v ${good}">${txt}</span></div>`;
+    let parts = null, mine = '';
+    if (F.r) { parts = F.r.parts; mine = F.r.ans; } else if (Q.tries.r) { parts = Q.tries.r.parts; mine = Q.tries.r.ans; }
+    const diff = parts ? parts.map((p) => (p.c ? '<span class="' + p.c + '">' + esc(p.w) + '</span>' : esc(p.w))).join(' ') : esc(q.r);
+    const lineRow = F.r
+      ? row('vr-line', 'r', 'La réplique', F.r.score === 2 ? 'good' : 'mid', (F.r.score === 2 ? 'Mot pour mot' : 'Presque') + ' ' + stageTxt(q, F.r.k) + ' · +' + F.r.pts)
+      : row('vr-line', 'r', 'La réplique', 'bad', 'Pas trouvée');
+    const epRow = F.e ? row('vr-ep', 'e', 'Le titre', 'good', 'Trouvé ' + stageTxt(q, F.e.k) + ' · +' + F.e.pts) : row('vr-ep', 'e', 'Le titre', 'bad', 'Pas trouvé');
+    const snRow = (k, label, val) => (q[k] == null ? '' : F[k]
+      ? row('vr-sn', k, label + ' ' + val, 'good', 'Trouvé · +' + F[k].pts)
+      : row('vr-sn', k, label + ' ' + val, 'bad', 'Raté'));
+    return `
+      <p class="reveal-pts"><b>+${fmtNum(R.pts)}</b> pts sur ${fmtNum(R.max)}</p>
+      ${lineRow}
+      <div class="answer">
+        ${mine && !F.r ? '<span class="lbl">Ta dernière réponse</span><p class="mine">' + esc(mine) + '</p>' : ''}
+        <span class="lbl">La vraie réplique</span>
+        <p>${diff}</p>
+        ${parts && (!F.r || F.r.score < 2) ? '<p class="legend"><span class="w-ok">en vert</span> : trouvé · <span class="w-miss">souligné</span> : manqué</p>' : ''}
+      </div>
+      ${epRow}
+      <div class="answer"><span class="lbl">L'épisode</span><p>${esc(q.e.split('/').map((x) => x.trim()).filter(Boolean).join(' · '))}</p></div>
+      ${snRow('s', 'Saison', q.s)}
+      ${snRow('n', 'Épisode', q.n)}
+      <div class="stack">
+        <button type="button" class="btn" data-act="q-scene">▶ Revoir la scène avec la réplique</button>
+        <button type="button" class="btn btn-primary" data-act="q-next">${last ? 'Voir mon verdict' : 'Scène suivante'}</button>
       </div>`;
   }
 
-  function quizAnswer(skip) {
+  function playStage(k) {
     const Q = S.quiz;
     const q = Q.data.q[Q.idx];
-    const line = skip ? '' : (document.getElementById('a-line') || {}).value || '';
-    const ep = skip ? '' : (document.getElementById('a-ep') || {}).value || '';
-    if (!skip && !line.trim() && !ep.trim()) { toast('Écris au moins quelque chose, ou appuie sur « Je sèche »'); return; }
-    const jl = judgeLine(q.r, line);
-    const je = judgeEpisode(q, ep);
-    Q.res[Q.idx] = { r: jl.score, e: je, line, ep, parts: jl.parts };
-    Q.phase = 'reveal';
-    if (jl.score === 2) SFX.exact(); else if (jl.score === 1) SFX.close(); else SFX.miss();
-    setTimeout(() => (je ? SFX.found() : null), 260);
-    renderQuiz(Q.key);
+    const st = stagesFor(q)[k];
+    if (!st) return;
+    if (k === 0) { showFrame(q.c); return; }
+    const to = st.k === 'full' ? q.c : Math.min(q.c, q.a + st.d);
+    showPlayer();
+    playSeg(q.a, to);
+  }
+  function showPlayer() {
+    const slot = document.getElementById('yt-slot');
+    if (!slot) return;
+    const r = slot.getBoundingClientRect();
+    if (r.top < 0 || r.bottom > window.innerHeight) slot.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
-  function vQuizReveal() {
+  function quizCheck() {
     const Q = S.quiz;
     const q = Q.data.q[Q.idx];
-    const R = Q.res[Q.idx];
-    const total = Q.data.q.length;
-    const last = Q.idx === total - 1;
-    const t = tally(Q.res);
-    const lineV = R.r === 2 ? ['good', 'Mot pour mot · +2'] : R.r === 1 ? ['mid', 'Presque · +1'] : ['bad', 'Ratée · 0'];
-    const epV = R.e ? ['good', 'Trouvé · +1'] : ['bad', 'Raté · 0'];
-    const diff = R.parts.map((p) => (p.c ? '<span class="' + p.c + '">' + esc(p.w) + '</span>' : esc(p.w))).join(' ');
-    return `
-      <div class="progress"><i style="width:${((Q.idx + 1) / total) * 100}%"></i></div>
-      <div class="q-count"><span>Réplique ${Q.idx + 1}/${total}</span><span>${t.rp} pts · ${t.ep} ép.</span></div>
+    const stages = stagesFor(q);
+    const m = stages[Q.stage].m;
+    const F = Q.F, T = Q.T;
+    Q.wrong = {};
+    let tried = false;
+    const gained = [];
+    if (!F.r && T.r.trim()) {
+      tried = true;
+      const j = judgeLine(q.r, T.r);
+      Q.tries.r = { ans: T.r, parts: j.parts };
+      if (j.score) {
+        F.r = { score: j.score, pts: round5((j.score === 2 ? BASE.r : BASE.r / 2) * m), k: Q.stage, ans: T.r, parts: j.parts };
+        gained.push('r');
+      } else Q.wrong.r = 1;
+    }
+    const code = parseCode(T.e);
+    if (!F.e && T.e.trim() && !onlyCode(T.e)) {
+      tried = true;
+      if (judgeEpisode(q, T.e)) { F.e = { pts: round5(BASE.e * m), k: Q.stage, ans: T.e }; gained.push('e'); } else Q.wrong.e = 1;
+    }
+    const sv = intOrNull(T.s) != null ? intOrNull(T.s) : code ? code[0] : null;
+    const nv = intOrNull(T.n) != null ? intOrNull(T.n) : code ? code[1] : null;
+    if (q.s != null && !F.s && sv != null) {
+      tried = true;
+      if (sv === q.s) { F.s = { pts: round5(BASE.s * m), k: Q.stage }; gained.push('s'); } else Q.wrong.s = 1;
+    }
+    if (q.n != null && !F.n && nv != null) {
+      tried = true;
+      if (nv === q.n) { F.n = { pts: round5(BASE.n * m), k: Q.stage }; gained.push('n'); } else Q.wrong.n = 1;
+    }
+    if (!tried) { toast('Écris une réponse, ou passe à l\'extrait suivant'); return; }
+    if (gained.indexOf('r') >= 0) (F.r.score === 2 ? SFX.exact : SFX.close)();
+    else if (gained.length) SFX.found();
+    else SFX.miss();
+    const need = ['r', 'e'].concat(q.s != null ? ['s'] : []).concat(q.n != null ? ['n'] : []);
+    if (need.every((k) => F[k])) { setTimeout(toReveal, 350); updatePlay(); return; }
+    const names = { r: 'la réplique', e: 'le titre', s: 'la saison', n: 'le numéro' };
+    const msg = gained.length ? 'Bien vu pour ' + gained.map((k) => names[k]).join(', ') + '. ' : '';
+    advanceStage(msg);
+  }
 
-      <div class="verdict-row vr-line"><span class="vr-k">La réplique</span><span class="vr-v ${lineV[0]}">${lineV[1]}</span></div>
-      <div class="answer">
-        <span class="lbl">Ta réponse</span>
-        <p class="${R.line.trim() ? 'mine' : 'empty'}">${R.line.trim() ? esc(R.line) : 'Rien écrit'}</p>
-        <span class="lbl">La vraie réplique</span>
-        <p>${diff}</p>
-        ${R.line.trim() && R.r < 2 ? '<p class="legend"><span class="w-ok">en vert</span> : trouvé · <span class="w-miss">souligné</span> : manqué</p>' : ''}
-      </div>
+  function advanceStage(msg) {
+    const Q = S.quiz;
+    const q = Q.data.q[Q.idx];
+    const stages = stagesFor(q);
+    if (Q.stage >= stages.length - 1) { toReveal(); return; }
+    Q.stage++;
+    const st = stages[Q.stage];
+    toast((msg || '') + (st.k === 'full' ? 'Toute la scène débloquée.' : 'Extrait de ' + st.label + ' débloqué.'));
+    updatePlay();
+    playStage(Q.stage);
+  }
 
-      <div class="verdict-row vr-ep"><span class="vr-k">L'épisode</span><span class="vr-v ${epV[0]}">${epV[1]}</span></div>
-      <div class="answer">
-        <span class="lbl">Ta réponse</span>
-        <p class="${R.ep.trim() ? 'mine' : 'empty'}">${R.ep.trim() ? esc(R.ep) : 'Rien écrit'}</p>
-        <span class="lbl">Le bon épisode</span>
-        <p>${esc(q.e)}${q.n ? ' <span style="color:var(--mu)">(' + esc(q.n) + ')</span>' : ''}</p>
-      </div>
-
-      <div class="stack"><button type="button" class="btn btn-primary" data-act="quiz-next">${last ? 'Voir mon verdict' : 'Réplique suivante'}</button></div>`;
+  function toReveal() {
+    const Q = S.quiz;
+    const q = Q.data.q[Q.idx];
+    const F = Q.F;
+    Q.res[Q.idx] = {
+      pts: curPts(F), max: qMax(q),
+      r: F.r ? F.r.score : 0, e: !!F.e, s: !!F.s, n: !!F.n,
+      hasSN: q.s != null && q.n != null
+    };
+    Q.phase = 'reveal';
+    PL.free = true;
+    updatePlay();
+    showPlayer();
+    playSeg(q.a, q.z != null ? q.z : q.c + 5);
   }
 
   function vQuizEnd() {
     const Q = S.quiz;
     const d = Q.data;
-    const t = tally(Q.res);
+    const t = quizTally(Q.res);
     const who = (Q.name || '').trim() || 'Toi';
-    let before = '', foot = '';
-    if (d.c) {
-      const win = t.pct > d.c.p, tie = t.pct === d.c.p;
-      before = `<div class="beat ${win ? 'win' : tie ? '' : 'lose'}"><div><span>${win ? 'Tu bats' : tie ? 'Égalité avec' : 'Toujours devant toi'}</span><br><b>${esc(d.c.n)}</b></div><strong>${d.c.p} %</strong></div>`;
-      foot = win ? 'Bat ' + d.c.n + ' (' + d.c.p + ' %)' : tie ? 'Égalité avec ' + d.c.n : d.c.n + ' reste devant (' + d.c.p + ' %)';
+    if (!t.n) {
+      S.cardData = null;
+      return `<div class="center-msg"><h1 class="page-title">Aucune scène jouable</h1><p>Les vidéos de ce blindtest ne peuvent pas être lues ici.</p>
+        <div class="stack"><a class="btn btn-primary" href="#/creer">Créer mon blindtest</a></div></div>`;
     }
-    S.cardData = { who, serie: d.s, t, foot };
-    S.cardText = 'J\'ai fait ' + t.pct + ' % au blindtest ' + d.s + ' : « ' + levelFor(t.pct).label + ' ». À toi : ' + quizUrl(Q.key);
+    let extra = '', foot = '';
+    if (d.c) {
+      const byPts = d.c.t != null;
+      const mine = byPts ? t.pts : t.pct, theirs = byPts ? d.c.t : d.c.p;
+      const unit = byPts ? ' pts' : ' %';
+      const win = mine > theirs, tie = mine === theirs;
+      extra = `<div class="beat ${win ? 'win' : tie ? '' : 'lose'}"><div><span>${win ? 'Tu bats' : tie ? 'Égalité avec' : 'Toujours devant toi'}</span><br><b>${esc(d.c.n)}</b></div><strong>${fmtNum(theirs)}${unit}</strong></div>`;
+      foot = win ? 'Bat ' + d.c.n + ' (' + fmtNum(theirs) + unit + ')' : tie ? 'Égalité avec ' + d.c.n : d.c.n + ' reste devant (' + fmtNum(theirs) + unit + ')';
+    }
+    const tiles = [
+      { cls: 's-line', k: 'Répliques', v: t.rf, max: t.n, sub: t.exact + ' mot pour mot' },
+      { cls: 's-ep', k: 'Épisodes', v: t.ef, max: t.n, sub: t.snMax ? t.sn + '/' + t.snMax + ' saison et numéro' : (t.ef > 1 ? 'titres trouvés' : 'titre trouvé') }
+    ];
+    S.cardData = { who, serie: d.s, pct: t.pct, tiles, pts: t.pts, foot };
+    S.cardText = 'J\'ai fait ' + fmtNum(t.pts) + ' points au blindtest ' + d.s + ' : « ' + levelFor(t.pct).label + ' ». À toi : ' + quizUrl(Q.key);
     return vVerdict({
       who,
       whoPrefix: 'Le verdict pour',
       serie: d.s,
-      t,
-      extra: before,
+      pct: t.pct,
+      pts: t.pts,
+      tiles,
+      extra,
       actions: `
         <section>
           <h3>Défie tes potes</h3>
-          <p class="page-sub">Le lien garde ton score : pour te battre, il faudra faire mieux que ${t.pct} %.</p>
+          <p class="page-sub">Le lien garde ton score : pour te battre, il faudra faire plus de ${fmtNum(t.pts)} points.</p>
           <div class="stack" style="margin-top:12px"><button type="button" class="btn btn-pink" data-act="quiz-defi">Créer mon lien défi</button></div>
           <div id="defi-out"></div>
         </section>
         <div class="stack">
-          <button type="button" class="btn" data-act="quiz-replay">Rejouer ce quiz</button>
-          <a class="btn btn-ghost" href="#/creer">Créer mon propre quiz</a>
+          <button type="button" class="btn" data-act="quiz-replay">Rejouer ce blindtest</button>
+          <a class="btn btn-ghost" href="#/creer">Créer mon propre blindtest</a>
         </div>`
     });
   }
 
   async function quizDefi() {
     const Q = S.quiz;
-    const t = tally(Q.res);
+    const t = quizTally(Q.res);
     const who = (Q.name || '').trim() || 'Ton pote';
-    const data = Object.assign({}, Q.raw, { c: { n: who.slice(0, 30), p: t.pct } });
+    const data = Object.assign({}, Q.raw, { c: { n: who.slice(0, 30), p: t.pct, t: t.pts } });
     const code = await encodeQuiz(data);
     const out = document.getElementById('defi-out');
     if (!out) return;
-    out.innerHTML = linkBox(quizUrl(code), who + ' a fait ' + t.pct + ' % au blindtest ' + Q.data.s + '. Tu fais mieux ?');
+    out.innerHTML = linkBox(quizUrl(code), who + ' a fait ' + fmtNum(t.pts) + ' points au blindtest ' + Q.data.s + '. Tu fais mieux ?');
   }
 
   /* =========================================================
@@ -1329,8 +1823,7 @@
     judge(b) {
       const d = S.duel;
       const k = b.dataset.k, v = +b.dataset.v;
-      const R = d.rounds[d.cur];
-      R[k] = v;
+      d.rounds[d.cur][k] = v;
       saveDuel();
       if (k === 'r') (v === 2 ? SFX.exact : v === 1 ? SFX.close : SFX.miss)();
       else (v ? SFX.found : SFX.miss)();
@@ -1380,6 +1873,8 @@
     'card-dl': cardDownload,
     copy: copyLink,
     'share-link': shareLink,
+
+    // éditeur
     'q-add'() {
       syncDraftFromDom();
       draft().qs.push(newQ());
@@ -1389,8 +1884,8 @@
       const lastCard = cards[cards.length - 1];
       if (lastCard) {
         lastCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        const ta = lastCard.querySelector('textarea');
-        if (ta) setTimeout(() => ta.focus({ preventScroll: true }), 350);
+        const inp = lastCard.querySelector('input');
+        if (inp) setTimeout(() => inp.focus({ preventScroll: true }), 350);
       }
     },
     'q-del'(b) {
@@ -1403,48 +1898,101 @@
       saveDraft();
       rerender();
     },
+    'ed-open'(b) { openEditor(+b.dataset.i); },
+    't-now'(b) {
+      const i = +b.dataset.i;
+      const p = editorFor(i);
+      if (!p) return;
+      const t = r1(p.getCurrentTime() || 0);
+      setQField(i, b.dataset.f, fmtClock(t));
+      const names = { c: 'Coupure', a: 'Début', z: 'Fin' };
+      toast(names[b.dataset.f] + ' réglée à ' + fmtClock(t));
+    },
+    't-nudge'(b) {
+      const i = +b.dataset.i;
+      const q = draft().qs[i];
+      const c = parseClock(q.c);
+      if (!validTime(c)) { toast('Règle d\'abord la coupure'); return; }
+      const nc = Math.max(0, r1(c + +b.dataset.d));
+      setQField(i, 'c', fmtClock(nc));
+      if (PL.p && PL.mode === 'edit' && PL.card === i) { try { PL.p.pauseVideo(); PL.p.seekTo(nc, true); } catch (e) { /* rien */ } }
+    },
+    't-test'(b) {
+      const i = +b.dataset.i;
+      const p = editorFor(i);
+      if (!p) return;
+      const q = draft().qs[i];
+      const c = parseClock(q.c);
+      if (!validTime(c)) { toast('Règle d\'abord la coupure'); return; }
+      if (b.dataset.k === 'cut') playSeg(Math.max(0, c - 3), c);
+      else { const z = parseClock(q.z); playSeg(c, validTime(z) && z > c ? z : c + 4); }
+    },
     build,
     'draft-reset'() {
-      if (!confirm('Effacer tout le quiz en cours ?')) return;
+      if (!confirm('Effacer tout le blindtest en cours ?')) return;
       S.draft = null;
-      store.del('tf_draft');
+      store.del('tf_draft2');
       rerender();
     },
+
+    // partie
     'quiz-go'() {
       const Q = S.quiz;
       audio();
       Q.phase = 'q';
       Q.idx = 0;
       Q.res = [];
-      renderQuiz(Q.key);
+      newRound(Q);
+      S.route = null;
+      paintPlay();
     },
-    'quiz-check'() { quizAnswer(false); },
-    'quiz-skip'() { quizAnswer(true); },
-    'quiz-next'() {
+    stg(b) {
       const Q = S.quiz;
+      const k = +b.dataset.k;
+      if (k > Q.stage) return;
+      playStage(k);
+    },
+    'q-check': quizCheck,
+    'q-pass'() { advanceStage(''); },
+    'q-scene'() {
+      const q = S.quiz.data.q[S.quiz.idx];
+      showPlayer();
+      playSeg(q.a, q.z != null ? q.z : q.c + 5);
+    },
+    'q-skipvid'() {
+      const Q = S.quiz;
+      Q.res[Q.idx] = { pts: 0, max: 0, skipped: true };
+      ACT['q-next']();
+    },
+    'q-next'() {
+      const Q = S.quiz;
+      segStop();
       if (Q.idx >= Q.data.q.length - 1) {
         Q.phase = 'end';
         SFX.win();
-      } else {
-        Q.idx++;
-        Q.phase = 'q';
+        destroyPlayer();
+        S.route = null;
+        paint(vQuizEnd(), 'q-end', afterVerdict);
+        return;
       }
-      renderQuiz(Q.key);
+      Q.idx++;
+      Q.phase = 'q';
+      newRound(Q);
+      PL.free = false;
+      updatePlay();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      loadQuestionVideo();
     },
     'quiz-replay'() {
       const Q = S.quiz;
       Q.phase = 'q';
       Q.idx = 0;
       Q.res = [];
-      renderQuiz(Q.key);
+      newRound(Q);
+      S.route = null;
+      paintPlay();
     },
-    'quiz-defi': quizDefi,
-    'yt-replay'() {
-      const f = document.getElementById('yt-frame');
-      if (!f) return;
-      const q = S.quiz.data.q[S.quiz.idx];
-      f.src = ytEmbed(q) + '&autoplay=1';
-    }
+    'quiz-defi': quizDefi
   };
 
   document.addEventListener('click', (e) => {
@@ -1456,9 +2004,10 @@
   document.addEventListener('input', onInput);
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' || e.shiftKey) return;
-    const id = e.target && e.target.id;
-    if (id === 'a-ep') { e.preventDefault(); quizAnswer(false); }
-    else if (e.target && e.target.dataset && e.target.dataset.bind === 'qname') { e.preventDefault(); ACT['quiz-go'](); }
+    const t = e.target;
+    if (!t || !t.dataset) return;
+    if (t.dataset.bind === 'qa' && t.tagName === 'INPUT') { e.preventDefault(); quizCheck(); }
+    else if (t.dataset.bind === 'qname') { e.preventDefault(); ACT['quiz-go'](); }
   });
   window.addEventListener('hashchange', () => { S.route = null; render(); });
 
@@ -1469,7 +2018,7 @@
   }
 
   // Exposé pour les essais automatiques uniquement
-  window.__tropfan = { judgeLine, judgeEpisode, parseYT, parseClock, parseCode, encodeQuiz, decodeQuiz };
+  window.__tropfan = { judgeLine, judgeEpisode, parseYT, parseClock, fmtClock, parseCode, onlyCode, stagesFor, encodeQuiz, decodeQuiz, PL };
 
   render();
 })();
