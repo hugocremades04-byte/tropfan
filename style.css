@@ -893,6 +893,76 @@ input:focus, textarea:focus { border-color: var(--lime); box-shadow: 0 0 0 3px r
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
+/* ---------- Rick et Morty : sans fin et défi du jour ---------- */
+.rm-card {
+  position: relative;
+  overflow: hidden;
+  margin-top: 26px;
+  padding: 22px 20px 20px;
+  border-radius: 22px;
+  background: var(--s1);
+  border: 1px solid rgba(201, 242, 61, .32);
+  --acc: var(--lime);
+}
+.rm-card::after {
+  content: '';
+  position: absolute;
+  width: 320px;
+  height: 320px;
+  right: -130px;
+  top: -150px;
+  border-radius: 50%;
+  background: radial-gradient(closest-side, rgba(201, 242, 61, .4), transparent);
+  opacity: .5;
+  pointer-events: none;
+}
+.rm-top { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.rm-card h2 { position: relative; font-size: 32px; line-height: 1; letter-spacing: -.03em; font-weight: 800; margin: 14px 0 8px; }
+.rm-card p { position: relative; color: var(--mu); font-size: 16px; text-wrap: pretty; }
+.rm-card .stack { position: relative; z-index: 1; }
+.lang-pick { width: 128px; flex: none; }
+.lang-pick button { min-height: 38px; }
+.seg a {
+  display: grid;
+  place-items: center;
+  min-height: 44px;
+  border-radius: 10px;
+  color: var(--mu);
+  font-weight: 700;
+  text-decoration: none;
+  transition: background .15s, color .15s;
+}
+.seg a.on { background: var(--s3); color: var(--tx); box-shadow: inset 0 0 0 1px var(--line2); }
+.lang-seg { margin-top: 18px; max-width: 220px; }
+.rm-best { margin-top: 12px; color: var(--mu); font-size: 15px; }
+.rm-best b { color: var(--tx); font-variant-numeric: tabular-nums; }
+.rm-best.record { color: var(--lime); font-weight: 800; font-size: 18px; }
+.modes-h { margin-top: 34px; }
+.lives { display: inline-flex; gap: 3px; letter-spacing: 0; }
+.lives i { font-style: normal; color: var(--s3); font-size: 17px; line-height: 1; transition: color .3s; }
+.lives i.on { color: var(--pink); }
+.life-lost {
+  margin-top: 10px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(255, 111, 160, .08);
+  border: 1px solid rgba(255, 111, 160, .35);
+  color: var(--pink);
+  font-weight: 700;
+}
+.ep-code { margin-left: 6px; color: var(--mu); font-size: 14px; font-weight: 700; }
+.ans.given { border-style: dashed; }
+.ans.given .ans-v { color: var(--mu); }
+.given-note { margin-top: 8px; color: var(--mu); font-size: 14px; }
+pre.grid {
+  margin-top: 16px;
+  font-family: inherit;
+  font-size: 26px;
+  line-height: 1.25;
+  letter-spacing: 2px;
+  white-space: pre;
+}
+
 @media (min-width: 600px) {
   .app { padding-top: 24px; }
 }

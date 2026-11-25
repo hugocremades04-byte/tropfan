@@ -549,9 +549,12 @@
     list.forEach((s, i) => { s.m = i === 0 ? 1 : i === list.length - 1 ? LAST_MULT : MULTS[i]; });
     return list;
   }
-  const qMax = (q) => BASE.r + BASE.e + (q.s != null ? BASE.s : 0) + (q.n != null ? BASE.n : 0);
+  const qMax = (q) => BASE.r + (q.noE ? 0 : BASE.e) + (q.s != null ? BASE.s : 0) + (q.n != null ? BASE.n : 0);
+  // l'épisode est-il demandé, et est-il trouvé (le titre, ou la saison et le numéro demandés)
+  const epAsked = (q) => !q.noE || q.s != null || q.n != null;
+  const epFound = (q, F) => !!(F.e || ((q.s != null || q.n != null) && (q.s == null || F.s) && (q.n == null || F.n)));
   function quizTally(res) {
-    const t = { pts: 0, max: 0, n: 0, rf: 0, exact: 0, ef: 0, sn: 0, snMax: 0 };
+    const t = { pts: 0, max: 0, n: 0, rf: 0, exact: 0, ef: 0, eMax: 0, sn: 0, snMax: 0 };
     res.forEach((r) => {
       if (!r || r.skipped) return;
       t.n++;
@@ -559,7 +562,8 @@
       t.max += r.max;
       if (r.r) t.rf++;
       if (r.r === 2) t.exact++;
-      if (r.e) t.ef++;
+      if (r.epAsk !== false) t.eMax++;
+      if (r.ep != null ? r.ep : r.e) t.ef++;
       if (r.hasSN) { t.snMax++; if (r.s && r.n) t.sn++; }
     });
     t.pct = t.max ? Math.round(100 * t.pts / t.max) : 0;
@@ -587,6 +591,7 @@
     destroyPlayer();
     const h = location.hash.replace(/^#\/?/, '');
     if (h.indexOf('q/') === 0) { renderQuiz(h.slice(2)); return; }
+    if (h.indexOf('rm/') === 0) { renderSeries(h.slice(3)); return; }
     switch (h) {
       case '': paint(vHome(), 'home'); break;
       case 'duel': paint(vDuelSetup(), 'duel'); break;
@@ -630,7 +635,9 @@
         <p class="lead">Une image de la scène, puis 0,1 s, 0,5 s, 1 s… d'extrait. Trouve la réplique qui suit, l'épisode, la saison et le numéro. Plus tôt tu trouves, plus ça rapporte.</p>
       </section>
       ${resume}
-      <section class="modes">
+      ${vRmCard()}
+      <h3 class="modes-h">Autres modes</h3>
+      <section class="modes" style="margin-top:12px">
         <a class="mode mode-quiz" href="#/creer">
           <span class="mode-tag">Vrais extraits YouTube</span>
           <h2>Crée ton blindtest</h2>
@@ -660,7 +667,31 @@
           ${LEVELS.map((l, i) => '<li><b>' + esc(l.label) + '</b><span>' + LEVEL_BOUNDS[i][0] + ' à ' + LEVEL_BOUNDS[i][1] + ' %</span></li>').join('')}
         </ol>
       </section>
-      <p class="foot">Trop Fan n'est lié à aucune série, chaîne ou plateforme. Aucune vidéo n'est hébergée ici : les extraits sont lus depuis YouTube avec son lecteur officiel, et chaque blindtest est créé par ses joueurs. Pas de compte, pas de cookies.</p>`;
+      <p class="foot">Trop Fan n'est lié à aucune série, chaîne ou plateforme. Aucune vidéo n'est hébergée ici : les extraits sont lus depuis YouTube avec son lecteur officiel (pour Rick et Morty, uniquement des vidéos des chaînes officielles d'Adult Swim). Pas de compte, pas de cookies.</p>`;
+  }
+
+  function vRmCard() {
+    const lang = getLang();
+    const day = todayKey();
+    const done = store.get('tf_jour_' + lang + '_' + day, null);
+    const best = store.get('tf_best_' + lang, null);
+    const d = RM[lang];
+    if (!d) loadCat(lang).then(() => { if (S.route === 'home') paint(vHome(), 'home'); }).catch(() => {});
+    const n = d ? fmtNum(d.q.length) + ' scènes officielles en ' + LANGS[lang] : 'Des centaines de scènes officielles';
+    return `
+      <section class="rm-card">
+        <div class="rm-top">
+          <span class="mode-tag">Rick et Morty</span>
+          <div class="seg lang-pick">${['vf', 'vo'].map((l) => '<button type="button" class="' + (l === lang ? 'on' : '') + '" data-act="rm-lang" data-v="' + l + '">' + LANGS[l] + '</button>').join('')}</div>
+        </div>
+        <h2>Le blindtest sans fin</h2>
+        <p>${n}, tirées au hasard. Trois vies : tiens le plus longtemps possible.</p>
+        ${best ? '<p class="rm-best">Ton record en ' + LANGS[lang] + ' : <b>' + fmtNum(best.pts) + ' pts</b></p>' : ''}
+        <div class="stack" style="margin-top:16px">
+          <a class="btn btn-primary" href="#/rm/infini/${lang}">Mode sans fin</a>
+          <a class="btn" href="#/rm/jour/${lang}">${done ? 'Défi du jour n°' + dayNum(day) + ' : ' + fmtNum(done.t.pts) + ' pts ✓' : 'Défi du jour n°' + dayNum(day) + ' · 5 scènes'}</a>
+        </div>
+      </section>`;
   }
 
   /* =========================================================
@@ -1473,6 +1504,7 @@
     Q.wrong = {};
     Q.tries = {};
     Q.vidErr = '';
+    Q.lost = false;
   }
 
   async function renderQuiz(code) {
@@ -1548,8 +1580,13 @@
     const total = Q.data.q.length;
     const done = Q.res.reduce((a, r) => a + (r ? r.pts : 0), 0) + (Q.phase === 'q' ? curPts(Q.F) : 0);
     const prog = (Q.idx + (Q.phase === 'reveal' ? 1 : 0)) / total;
-    head.innerHTML = `<div class="progress"><i style="width:${prog * 100}%"></i></div>
+    if (Q.kind === 'infini') {
+      const hearts = Array.from({ length: VIES }, (x, k) => '<i class="' + (k < Q.lives ? 'on' : '') + '">♥</i>').join('');
+      head.innerHTML = `<div class="q-count"><span>Scène ${Q.idx + 1} · ${LANGS[Q.lang]}</span><span class="lives" aria-label="${plural(Q.lives, 'vie')}">${hearts}</span><span><b class="pts-live">${fmtNum(done)}</b> pts</span></div>`;
+    } else {
+      head.innerHTML = `<div class="progress"><i style="width:${prog * 100}%"></i></div>
       <div class="q-count"><span>Scène ${Q.idx + 1}/${total}</span><span><b class="pts-live">${fmtNum(done)}</b> pts</span></div>`;
+    }
     dyn.innerHTML = Q.phase === 'reveal' ? vPlayReveal() : vPlayQ();
   }
 
@@ -1571,15 +1608,17 @@
     const lockBox = (k, label, val, extra) => `<div class="ans locked"><span class="ans-k">${label}</span><p class="ans-v">${esc(val)}</p><span class="ans-pts">${extra} · +${F[k].pts}</span></div>`;
     const fieldR = F.r ? lockBox('r', 'La réplique qui suit', F.r.ans, F.r.score === 2 ? 'Mot pour mot' : 'Presque')
       : `<label class="ans${W.r ? ' wrong' : ''}"><span class="ans-k">La réplique qui suit</span><textarea data-bind="qa" data-f="r" rows="2" maxlength="500" placeholder="Écris-la mot pour mot">${esc(T.r)}</textarea></label>`;
-    const fieldE = F.e ? lockBox('e', 'Le titre de l\'épisode', F.e.ans, 'Trouvé')
-      : `<label class="ans${W.e ? ' wrong' : ''}"><span class="ans-k">Le titre de l'épisode</span><input id="a-ep" data-bind="qa" data-f="e" value="${esc(T.e)}" maxlength="200" placeholder="Le titre, à peu près suffit" autocomplete="off" enterkeyhint="done"></label>`;
+    const fieldE = q.noE ? givenBox(q)
+      : F.e ? lockBox('e', 'Le titre de l\'épisode', F.e.ans, 'Trouvé')
+        : `<label class="ans${W.e ? ' wrong' : ''}"><span class="ans-k">Le titre de l'épisode</span><input id="a-ep" data-bind="qa" data-f="e" value="${esc(T.e)}" maxlength="200" placeholder="Le titre, à peu près suffit" autocomplete="off" enterkeyhint="done"></label>`;
+    const givenSN = !q.noE && q.given ? '<p class="given-note">' + (q.given & 2 ? 'La saison' : 'Le numéro') + ' est déjà écrit' + (q.given & 2 ? 'e' : '') + ' dans le titre de la vidéo : ' + (q.given & 2 ? 'elle ne compte' : 'il ne compte') + ' pas.</p>' : '';
     const small = (k, label) => {
       if (q[k] == null) return '';
       if (F[k]) return `<div class="ans locked"><span class="ans-k">${label}</span><p class="ans-v">${q[k]}</p><span class="ans-pts">+${F[k].pts}</span></div>`;
       return `<label class="ans${W[k] ? ' wrong' : ''}"><span class="ans-k">${label}</span><input data-bind="qa" data-f="${k}" value="${esc(T[k])}" maxlength="3" inputmode="numeric" placeholder="?" autocomplete="off"></label>`;
     };
     const sn = small('s', 'Saison') + small('n', 'Épisode n°');
-    const worth = 'Une bonne réponse vaut maintenant : réplique ' + round5(BASE.r * st.m) + ' · titre ' + round5(BASE.e * st.m) +
+    const worth = 'Une bonne réponse vaut maintenant : réplique ' + round5(BASE.r * st.m) + (q.noE ? '' : ' · titre ' + round5(BASE.e * st.m)) +
       (q.s != null ? ' · saison ' + round5(BASE.s * st.m) : '') + (q.n != null ? ' · numéro ' + round5(BASE.n * st.m) : '');
     return `
       <div class="stages">${chips}</div>
@@ -1587,11 +1626,21 @@
       ${fieldR}
       ${fieldE}
       ${sn ? '<div class="sn-row">' + sn + '</div>' : ''}
+      ${givenSN}
       <div class="stack">
         <button type="button" class="btn btn-primary" data-act="q-check">Valider</button>
         <button type="button" class="btn btn-ghost" data-act="q-pass">${last ? 'Je donne ma langue au chat' : 'Passer : extrait suivant'}</button>
       </div>
       <p class="worth">${worth}</p>`;
+  }
+
+  // épisode déjà écrit dans le titre YouTube : on le donne, il ne rapporte rien
+  function givenBox(q) {
+    const k = q.given || 0;
+    let v = (q.disp || []).join(' · ');
+    if ((k & 2) && (k & 4)) v += ' · ' + q.code;
+    else if (k & 2) v += ' · saison ' + (+q.code.slice(1, 3));
+    return `<div class="ans given"><span class="ans-k">L'épisode</span><p class="ans-v">${esc(v)}</p><span class="ans-pts">Déjà écrit sur la vidéo, ne compte pas</span></div>`;
   }
 
   function stageTxt(q, k) {
@@ -1604,7 +1653,11 @@
     const q = Q.data.q[Q.idx];
     const F = Q.F;
     const R = Q.res[Q.idx] || { pts: 0, max: qMax(q) };
-    const last = Q.idx === Q.data.q.length - 1;
+    const endless = Q.kind === 'infini';
+    const last = endless ? Q.lives <= 0 : Q.idx === Q.data.q.length - 1;
+    const lifeMsg = endless && Q.lost
+      ? '<p class="life-lost">' + (Q.lives > 0 ? 'Une vie en moins. Il t\'en reste ' + Q.lives + '.' : 'Plus de vies : fin de la partie.') + '</p>' : '';
+    const epTxt = (q.disp || q.e.split('/')).map((x) => x.trim()).filter(Boolean).join(' · ');
     const row = (cls, k, label, good, txt) => `<div class="verdict-row ${cls}"><span class="vr-k">${label}</span><span class="vr-v ${good}">${txt}</span></div>`;
     let parts = null, mine = '';
     if (F.r) { parts = F.r.parts; mine = F.r.ans; } else if (Q.tries.r) { parts = Q.tries.r.parts; mine = Q.tries.r.ans; }
@@ -1612,12 +1665,13 @@
     const lineRow = F.r
       ? row('vr-line', 'r', 'La réplique', F.r.score === 2 ? 'good' : 'mid', (F.r.score === 2 ? 'Mot pour mot' : 'Presque') + ' ' + stageTxt(q, F.r.k) + ' · +' + F.r.pts)
       : row('vr-line', 'r', 'La réplique', 'bad', 'Pas trouvée');
-    const epRow = F.e ? row('vr-ep', 'e', 'Le titre', 'good', 'Trouvé ' + stageTxt(q, F.e.k) + ' · +' + F.e.pts) : row('vr-ep', 'e', 'Le titre', 'bad', 'Pas trouvé');
+    const epRow = q.noE ? '' : F.e ? row('vr-ep', 'e', 'Le titre', 'good', 'Trouvé ' + stageTxt(q, F.e.k) + ' · +' + F.e.pts) : row('vr-ep', 'e', 'Le titre', 'bad', 'Pas trouvé');
     const snRow = (k, label, val) => (q[k] == null ? '' : F[k]
       ? row('vr-sn', k, label + ' ' + val, 'good', 'Trouvé · +' + F[k].pts)
       : row('vr-sn', k, label + ' ' + val, 'bad', 'Raté'));
     return `
       <p class="reveal-pts"><b>+${fmtNum(R.pts)}</b> pts sur ${fmtNum(R.max)}</p>
+      ${lifeMsg}
       ${lineRow}
       <div class="answer">
         ${mine && !F.r ? '<span class="lbl">Ta dernière réponse</span><p class="mine">' + esc(mine) + '</p>' : ''}
@@ -1626,7 +1680,7 @@
         ${parts && (!F.r || F.r.score < 2) ? '<p class="legend"><span class="w-ok">en vert</span> : trouvé · <span class="w-miss">souligné</span> : manqué</p>' : ''}
       </div>
       ${epRow}
-      <div class="answer"><span class="lbl">L'épisode</span><p>${esc(q.e.split('/').map((x) => x.trim()).filter(Boolean).join(' · '))}</p></div>
+      <div class="answer"><span class="lbl">L'épisode</span><p>${esc(epTxt)}${q.code ? ' <span class="ep-code">' + q.code + '</span>' : ''}</p></div>
       ${snRow('s', 'Saison', q.s)}
       ${snRow('n', 'Épisode', q.n)}
       <div class="stack">
@@ -1671,7 +1725,7 @@
       } else Q.wrong.r = 1;
     }
     const code = parseCode(T.e);
-    if (!F.e && T.e.trim() && !onlyCode(T.e)) {
+    if (!q.noE && !F.e && T.e.trim() && !onlyCode(T.e)) {
       tried = true;
       if (judgeEpisode(q, T.e)) { F.e = { pts: round5(BASE.e * m), k: Q.stage, ans: T.e }; gained.push('e'); } else Q.wrong.e = 1;
     }
@@ -1689,7 +1743,7 @@
     if (gained.indexOf('r') >= 0) (F.r.score === 2 ? SFX.exact : SFX.close)();
     else if (gained.length) SFX.found();
     else SFX.miss();
-    const need = ['r', 'e'].concat(q.s != null ? ['s'] : []).concat(q.n != null ? ['n'] : []);
+    const need = ['r'].concat(q.noE ? [] : ['e']).concat(q.s != null ? ['s'] : []).concat(q.n != null ? ['n'] : []);
     if (need.every((k) => F[k])) { setTimeout(toReveal, 350); updatePlay(); return; }
     const names = { r: 'la réplique', e: 'le titre', s: 'la saison', n: 'le numéro' };
     const msg = gained.length ? 'Bien vu pour ' + gained.map((k) => names[k]).join(', ') + '. ' : '';
@@ -1717,6 +1771,14 @@
       r: F.r ? F.r.score : 0, e: !!F.e, s: !!F.s, n: !!F.n,
       hasSN: q.s != null && q.n != null
     };
+    if (Q.kind) {
+      Q.res[Q.idx].epAsk = epAsked(q);
+      Q.res[Q.idx].ep = epFound(q, F);
+    }
+    if (Q.kind === 'infini' && !Q.lost) {
+      // une vie en moins si ni la réplique ni l'épisode (titre, ou saison et numéro)
+      if (!(F.r || epFound(q, F))) { Q.lost = true; Q.lives = Math.max(0, Q.lives - 1); }
+    }
     Q.phase = 'reveal';
     PL.free = true;
     updatePlay();
@@ -1780,6 +1842,302 @@
     const out = document.getElementById('defi-out');
     if (!out) return;
     out.innerHTML = linkBox(quizUrl(code), who + ' a fait ' + fmtNum(t.pts) + ' points au blindtest ' + Q.data.s + '. Tu fais mieux ?');
+  }
+
+  /* =========================================================
+     Rick et Morty : mode sans fin et défi du jour
+     (extraits des chaînes YouTube officielles, lus avec le lecteur YouTube)
+     ========================================================= */
+  const RM = { vf: null, vo: null };
+  const LANGS = { vf: 'VF', vo: 'VO' };
+  const DAY0 = Date.UTC(2026, 10, 25);
+  const JOUR_N = 5;
+  const VIES = 3;
+
+  const getLang = () => (store.get('tf_lang', 'vf') === 'vo' ? 'vo' : 'vf');
+  const RM_P = {};
+  function loadCat(lang) {
+    if (RM[lang]) return Promise.resolve(RM[lang]);
+    if (!RM_P[lang]) {
+      RM_P[lang] = fetch('data/rm-' + lang + '.json').then((r) => {
+        if (!r.ok) throw new Error('cat');
+        return r.json();
+      }).then((d) => {
+        const byEp = {};
+        d.q.forEach((x, i) => { (byEp[x[5]] = byEp[x[5]] || []).push(i); });
+        d.byEp = byEp;
+        d.epList = Object.keys(byEp).sort();
+        RM[lang] = d;
+        return d;
+      }).catch((e) => { RM_P[lang] = null; throw e; });
+    }
+    return RM_P[lang];
+  }
+  function catQ(d, i) {
+    const x = d.q[i];
+    const code = x[5];
+    const titles = (d.eps[code] || []).filter(Boolean);
+    const disp = titles.slice(0, 2).filter((t, k, arr) => arr.indexOf(t) === k);
+    // masque : ce que le titre de la vidéo YouTube montre déjà (1 titre, 2 saison, 4 numéro)
+    const k = x[6] || 0;
+    return {
+      id: i, y: x[0], a: x[1], c: x[2], z: x[3], r: x[4], e: titles.join(' / '), disp, code,
+      s: k & 2 ? null : +code.slice(1, 3), n: k & 4 ? null : +code.slice(4, 6), noE: !!(k & 1), given: k
+    };
+  }
+
+  function todayKey() {
+    const d = new Date();
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+  function dayNum(key) {
+    const p = key.split('-').map(Number);
+    return Math.max(1, Math.floor((Date.UTC(p[0], p[1] - 1, p[2]) - DAY0) / 864e5) + 1);
+  }
+  function rng(seed) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hashStr(s) {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  // Les mêmes 5 scènes pour tout le monde ce jour-là, dans 5 épisodes différents
+  function dailyPicks(d, key, lang) {
+    const R = rng(hashStr('tropfan-rm-' + lang + '-' + key));
+    const eps = d.epList.slice();
+    const out = [];
+    while (out.length < JOUR_N && eps.length) {
+      const e = eps.splice(Math.floor(R() * eps.length), 1)[0];
+      // de préférence une scène où l'épisode n'est pas écrit sur la vidéo
+      const full = d.byEp[e].filter((i) => !d.q[i][6]);
+      const ids = full.length ? full : d.byEp[e];
+      out.push(ids[Math.floor(R() * ids.length)]);
+    }
+    return out;
+  }
+  // Mode sans fin : un épisode au hasard, puis une scène jamais vue de cet épisode
+  function nextEndless(Q) {
+    const d = Q.cat;
+    const seenKey = 'tf_vu_' + Q.lang;
+    let seen = new Set(store.get(seenKey, []));
+    const used = new Set(Q.data.q.map((q) => q.id));
+    const bad = Q.bad || new Set();
+    const ok = (i) => !seen.has(i) && !used.has(i) && !bad.has(d.q[i][0]);
+    const fresh = (e) => d.byEp[e].some(ok);
+    let eps = d.epList.filter(fresh);
+    if (!eps.length) {
+      seen = new Set();
+      eps = d.epList.filter(fresh);
+    }
+    if (!eps.length) eps = d.epList.slice();
+    const last = Q.data.q.length ? Q.data.q[Q.data.q.length - 1].code : null;
+    const pool = eps.length > 1 ? eps.filter((e) => e !== last) : eps;
+    const e = pool[Math.floor(Math.random() * pool.length)];
+    let ids = d.byEp[e].filter(ok);
+    if (!ids.length) ids = d.byEp[e].filter((i) => !used.has(i));
+    if (!ids.length) ids = d.byEp[e];
+    const id = ids[Math.floor(Math.random() * ids.length)];
+    seen.add(id);
+    store.set(seenKey, Array.from(seen).slice(-4000));
+    Q.data.q.push(catQ(d, id));
+  }
+
+  async function renderSeries(path) {
+    const parts = path.split('?');
+    const seg = parts[0].split('/');
+    const kind = seg[0], lang = seg[1] === 'vo' ? 'vo' : 'vf';
+    if (kind !== 'infini' && kind !== 'jour') { go('#/'); return; }
+    store.set('tf_lang', lang);
+    const day = todayKey();
+    const key = 'rm/' + kind + '/' + lang + (kind === 'jour' ? '/' + day : '') + (parts[1] ? '?' + parts[1] : '');
+    if (!S.quiz || S.quiz.key !== key) {
+      S.quiz = { key, loading: true };
+      paint('<div class="center-msg"><p>Chargement des scènes…</p></div>', 'q-load');
+      try {
+        const cat = await loadCat(lang);
+        const Q = {
+          key, kind, lang, cat, day, phase: 'intro', idx: 0, res: [], lives: VIES,
+          name: store.get('tf_name', '') || '',
+          data: { s: 'Rick et Morty', q: [], c: null }
+        };
+        if (kind === 'jour') {
+          Q.data.q = dailyPicks(cat, day, lang).map((i) => catQ(cat, i));
+          Q.done = store.get('tf_jour_' + lang + '_' + day, null);
+          if (Q.done) Q.phase = 'end';
+        }
+        const m = parts[1] && parts[1].match(/(?:^|&)d=([^&]*)/);
+        if (m) {
+          let raw = m[1];
+          try { raw = decodeURIComponent(raw); } catch (e) { /* lien abîmé : on garde le texte brut */ }
+          const v = raw.split('~');
+          if (v[0] && /^\d{1,7}$/.test(v[1] || '')) Q.data.c = { n: v[0].slice(0, 30), t: +v[1], p: 0 };
+        }
+        newRound(Q);
+        S.quiz = Q;
+      } catch (e) {
+        S.quiz = { key, error: 'cat' };
+      }
+      if (S.quiz.key !== key || location.hash.replace(/^#\/?/, '') !== 'rm/' + path) return;
+    }
+    const Q = S.quiz;
+    if (Q.loading) return;
+    if (Q.error) {
+      paint(`<div class="center-msg"><h1 class="page-title">Scènes indisponibles</h1><p>Impossible de charger les scènes. Vérifie ta connexion puis recharge la page.</p>
+        <div class="stack"><a class="btn btn-primary" href="#/">Accueil</a></div></div>`, 'q-err');
+      return;
+    }
+    if (Q.phase === 'intro') paint(vSeriesIntro(), 'q-intro');
+    else if (Q.phase === 'end') paint(vSeriesEnd(), 'q-end', afterVerdict);
+    else paintPlay();
+  }
+
+  function langSeg(kind, lang) {
+    return '<div class="seg lang-seg">' + ['vf', 'vo'].map((l) => '<a class="' + (l === lang ? 'on' : '') + '" href="#/rm/' + kind + '/' + l + '">' + LANGS[l] + '</a>').join('') + '</div>';
+  }
+
+  function vSeriesIntro() {
+    const Q = S.quiz;
+    const c = Q.data.c;
+    const best = store.get('tf_best_' + Q.lang, null);
+    const n = Q.cat.q.length;
+    const endless = Q.kind === 'infini';
+    return `
+      <p class="kicker" style="margin-top:18px">Rick et Morty · ${LANGS[Q.lang]}</p>
+      <h1 class="page-title">${endless ? 'Mode sans fin' : 'Défi du jour n°' + dayNum(Q.day)}</h1>
+      <p class="page-sub">${endless
+        ? fmtNum(n) + ' scènes officielles en ' + LANGS[Q.lang] + ', tirées au hasard. Tu as ' + VIES + ' vies.'
+        : JOUR_N + ' scènes, les mêmes pour tout le monde aujourd\'hui. Un seul essai.'}</p>
+      ${langSeg(Q.kind, Q.lang)}
+      ${c ? `<div class="beat"><div><span>Score à battre</span><br><b>${esc(c.n)}</b></div><strong>${fmtNum(c.t)} pts</strong></div>` : ''}
+      ${endless && best ? `<p class="rm-best">Ton record en ${LANGS[Q.lang]} : <b>${fmtNum(best.pts)} pts</b> (${plural(best.n, 'scène')})</p>` : ''}
+      <ol class="how" style="margin-top:20px">
+        <li>Tu vois une image de la scène, juste avant une réplique.</li>
+        <li>Trouve la réplique qui suit, le titre de l'épisode, la saison et le numéro.</li>
+        <li>Bloqué ? Débloque 0,1 s, 0,5 s, 1 s, 2 s, 4 s puis toute la scène. Chaque indice fait baisser les points.</li>
+        <li>Quand l'épisode est déjà écrit dans le titre de la vidéo YouTube, on te le donne : seule la réplique compte.</li>
+        ${endless ? '<li>Une vie en moins quand tu ne trouves ni la réplique ni l\'épisode.</li>' : ''}
+      </ol>
+      ${multChips()}
+      <label class="field"><span>Ton prénom</span>
+        <input data-bind="qname" value="${esc(Q.name)}" placeholder="Pour la carte du verdict" maxlength="24" autocomplete="off" enterkeyhint="go"></label>
+      <div class="stack"><button type="button" class="btn btn-primary" data-act="quiz-go">C'est parti, avec le son</button></div>
+      <p class="small-note">Extraits officiels (${Q.lang === 'vf' ? 'Adult Swim France' : 'chaîne Rick and Morty d\'Adult Swim'}), lus sur YouTube. Les répliques ${Q.lang === 'vf' ? 'ont été transcrites automatiquement : une petite faute peut traîner' : 'viennent des transcriptions des fans'}.</p>`;
+  }
+
+  function dayGrid(res) {
+    const line = res.map((r) => (!r || r.skipped ? '▫️' : r.r === 2 ? '🟩' : r.r === 1 ? '🟨' : '⬛')).join('');
+    const ep = res.map((r) => (!r || r.skipped || r.epAsk === false ? '▫️' : r.ep ? '🟩' : r.s || r.n ? '🟨' : '⬛')).join('');
+    return { line, ep };
+  }
+  function untilTomorrow() {
+    const now = new Date();
+    const t = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    const m = Math.max(1, Math.round((t - now) / 60000));
+    return Math.floor(m / 60) + ' h ' + String(m % 60).padStart(2, '0');
+  }
+
+  function vSeriesEnd() {
+    const Q = S.quiz;
+    const lang = LANGS[Q.lang];
+    const who = (Q.name || '').trim() || 'Toi';
+    const base = location.origin + location.pathname;
+    let t, grid;
+    if (Q.kind === 'jour' && Q.done && !Q.res.length) {
+      t = Q.done.t;
+      grid = Q.done.g;
+    } else {
+      t = quizTally(Q.res);
+      if (Q.kind === 'jour') {
+        grid = dayGrid(Q.res);
+        if (!Q.done) {
+          Q.done = { t, g: grid };
+          store.set('tf_jour_' + Q.lang + '_' + Q.day, Q.done);
+        }
+      }
+    }
+    const tiles = [
+      { cls: 's-line', k: 'Répliques', v: t.rf, max: t.n, sub: t.exact + ' mot pour mot' },
+      { cls: 's-ep', k: 'Épisodes', v: t.ef, max: t.eMax, sub: t.snMax ? t.sn + '/' + t.snMax + ' saison et numéro' : 'reconnus', csub: t.snMax ? t.sn + ' saison et numéro' : 'reconnus' }
+    ];
+    let extra = '', foot = '';
+    if (Q.kind === 'infini') {
+      if (!Q.saved) {
+        const best = store.get('tf_best_' + Q.lang, null);
+        Q.prevBest = best;
+        Q.record = t.pts > 0 && (!best || t.pts > best.pts);
+        if (Q.record) store.set('tf_best_' + Q.lang, { pts: t.pts, n: t.n });
+        Q.saved = true;
+      }
+      extra = Q.record ? '<p class="rm-best record">Nouveau record en ' + lang + ' !</p>'
+        : Q.prevBest ? '<p class="rm-best">Ton record en ' + lang + ' : <b>' + fmtNum(Q.prevBest.pts) + ' pts</b></p>' : '';
+      foot = plural(t.n, 'scène') + ' tenue' + (t.n > 1 ? 's' : '') + ' en ' + lang;
+      if (Q.data.c) {
+        const win = t.pts > Q.data.c.t, tie = t.pts === Q.data.c.t;
+        extra += `<div class="beat ${win ? 'win' : tie ? '' : 'lose'}"><div><span>${win ? 'Tu bats' : tie ? 'Égalité avec' : 'Toujours devant toi'}</span><br><b>${esc(Q.data.c.n)}</b></div><strong>${fmtNum(Q.data.c.t)} pts</strong></div>`;
+        foot = win ? 'Bat ' + Q.data.c.n + ' (' + fmtNum(Q.data.c.t) + ' pts)' : foot;
+      }
+      S.cardText = 'J\'ai tenu ' + plural(t.n, 'scène') + ' de Rick et Morty en ' + lang + ' : ' + fmtNum(t.pts) + ' points. Bats-moi : ' + base + '#/rm/infini/' + Q.lang;
+    } else {
+      foot = 'Défi du jour n°' + dayNum(Q.day) + ' en ' + lang;
+      S.cardText = shareDayText(Q, t, grid);
+      extra = `<pre class="grid">${esc(grid.line)}\n${esc(grid.ep)}</pre><p class="rm-best">Prochain défi dans ${untilTomorrow()}</p>`;
+    }
+    S.cardData = { who, serie: 'Rick et Morty ' + lang, pct: t.pct, tiles, pts: t.pts, foot };
+    const other = Q.lang === 'vf' ? 'vo' : 'vf';
+    return vVerdict({
+      who,
+      whoPrefix: 'Le verdict pour',
+      serie: 'Rick et Morty · ' + lang + (Q.kind === 'jour' ? ' · Défi du jour n°' + dayNum(Q.day) : ' · Mode sans fin'),
+      pct: t.pct,
+      pts: t.pts,
+      tiles,
+      extra,
+      actions: Q.kind === 'infini' ? `
+        <section>
+          <h3>Défie tes potes</h3>
+          <p class="page-sub">Le lien affiche ton score à battre : ${fmtNum(t.pts)} points.</p>
+          <div class="stack" style="margin-top:12px"><button type="button" class="btn btn-pink" data-act="rm-defi">Créer mon lien défi</button></div>
+          <div id="defi-out"></div>
+        </section>
+        <div class="stack">
+          <button type="button" class="btn btn-primary" data-act="quiz-replay">Rejouer</button>
+          <a class="btn" href="#/rm/jour/${Q.lang}">Défi du jour</a>
+          <a class="btn btn-ghost" href="#/rm/infini/${other}">Essayer en ${LANGS[other]}</a>
+        </div>` : `
+        <div class="stack">
+          <button type="button" class="btn btn-pink" data-act="rm-share-day">Partager mon résultat</button>
+          <a class="btn btn-primary" href="#/rm/infini/${Q.lang}">Mode sans fin</a>
+          <a class="btn btn-ghost" href="#/rm/jour/${other}">Défi du jour en ${LANGS[other]}</a>
+        </div>`
+    });
+  }
+  function shareDayText(Q, t, grid) {
+    return 'Trop Fan · Rick et Morty ' + LANGS[Q.lang] + ' · Défi n°' + dayNum(Q.day) + '\n' +
+      'Répliques ' + grid.line + '\nÉpisodes  ' + grid.ep + '\n' + fmtNum(t.pts) + ' points\n' +
+      location.origin + location.pathname + '#/rm/jour/' + Q.lang;
+  }
+  async function shareDay() {
+    const txt = S.cardText;
+    if (navigator.share) {
+      try { await navigator.share({ text: txt }); return; } catch (e) { if (e && e.name === 'AbortError') return; }
+    }
+    try { await navigator.clipboard.writeText(txt); toast('Résultat copié, colle-le où tu veux'); } catch (e) { toast('Copie impossible sur ce navigateur'); }
+  }
+  function rmDefi() {
+    const Q = S.quiz;
+    const t = quizTally(Q.res);
+    const who = ((Q.name || '').trim() || 'Ton pote').replace(/[~&#?]/g, '').slice(0, 30);
+    const url = location.origin + location.pathname + '#/rm/infini/' + Q.lang + '?d=' + encodeURIComponent(who + '~' + t.pts);
+    const out = document.getElementById('defi-out');
+    if (out) out.innerHTML = linkBox(url, who + ' a fait ' + fmtNum(t.pts) + ' points sur Rick et Morty en ' + LANGS[Q.lang] + '. Tu fais mieux ?');
   }
 
   /* =========================================================
@@ -1938,10 +2296,18 @@
     // partie
     'quiz-go'() {
       const Q = S.quiz;
+      if (!Q || !Q.data) return;
+      if (Q.kind === 'jour' && Q.done) return;
       audio();
       Q.phase = 'q';
       Q.idx = 0;
       Q.res = [];
+      if (Q.kind === 'infini') {
+        Q.data.q = [];
+        Q.lives = VIES;
+        Q.saved = false;
+        nextEndless(Q);
+      }
       newRound(Q);
       S.route = null;
       paintPlay();
@@ -1962,19 +2328,22 @@
     'q-skipvid'() {
       const Q = S.quiz;
       Q.res[Q.idx] = { pts: 0, max: 0, skipped: true };
+      if (Q.kind) (Q.bad = Q.bad || new Set()).add(Q.data.q[Q.idx].y);
       ACT['q-next']();
     },
     'q-next'() {
       const Q = S.quiz;
       segStop();
-      if (Q.idx >= Q.data.q.length - 1) {
+      const over = Q.kind === 'infini' ? Q.lives <= 0 : Q.idx >= Q.data.q.length - 1;
+      if (over) {
         Q.phase = 'end';
         SFX.win();
         destroyPlayer();
         S.route = null;
-        paint(vQuizEnd(), 'q-end', afterVerdict);
+        paint(Q.kind ? vSeriesEnd() : vQuizEnd(), 'q-end', afterVerdict);
         return;
       }
+      if (Q.kind === 'infini') nextEndless(Q);
       Q.idx++;
       Q.phase = 'q';
       newRound(Q);
@@ -1985,6 +2354,8 @@
     },
     'quiz-replay'() {
       const Q = S.quiz;
+      if (Q.kind === 'infini') { ACT['quiz-go'](); return; }
+      if (Q.kind === 'jour') return;
       Q.phase = 'q';
       Q.idx = 0;
       Q.res = [];
@@ -1992,7 +2363,13 @@
       S.route = null;
       paintPlay();
     },
-    'quiz-defi': quizDefi
+    'quiz-defi': quizDefi,
+    'rm-defi': rmDefi,
+    'rm-share-day': shareDay,
+    'rm-lang'(b) {
+      store.set('tf_lang', b.dataset.v === 'vo' ? 'vo' : 'vf');
+      paint(vHome(), 'home');
+    }
   };
 
   document.addEventListener('click', (e) => {
